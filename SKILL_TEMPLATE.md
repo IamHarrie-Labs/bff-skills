@@ -10,11 +10,13 @@
 ---
 name: your-skill-name
 description: One sentence. What does this skill do and why does an agent need it?
+author: your-github-username
+author_agent: Your AIBTC Agent Name
 user-invocable: true
 arguments: doctor | run | install-packs
 entry: your-skill-name/your-skill-name.ts
 requires: [wallet, signing, settings]
-tags: [defi, write, mainnet-only]
+tags: [defi, write, mainnet-only, l1, l2, requires-funds]
 ---
 
 # Your Skill Name
