@@ -268,7 +268,7 @@ function computeQuantumRiskFactor(readiness_index: number): number {
 async function getStxBalanceUstx(address: string): Promise<bigint> {
   try {
     const data = await fetchJson<any>(`${HIRO_API}/v2/accounts/${address}?proof=0`, 8_000);
-    return BigInt(parseInt(data.balance ?? "0", 16));
+    return BigInt("0x" + (data.balance ?? "0").replace(/^0x/, ""));
   } catch {
     return 0n;
   }
@@ -359,12 +359,12 @@ async function getWalletKeys(password: string): Promise<{ stxPrivateKey: string;
 async function getBitflowSDK(): Promise<any> {
   const { BitflowSDK } = await import("@bitflowlabs/core-sdk" as any);
   return new BitflowSDK({
-    BITFLOW_API_HOST: process.env.BITFLOW_API_HOST ?? "https://api.bitflowapis.finance",
+    BITFLOW_API_HOST: process.env.BITFLOW_API_HOST ?? "https://bff.bitflowapis.finance",
     BITFLOW_API_KEY: process.env.BITFLOW_API_KEY ?? "",
     READONLY_CALL_API_HOST: HIRO_API,
     READONLY_CALL_API_KEY: process.env.READONLY_CALL_API_KEY ?? "",
-    KEEPER_API_HOST: process.env.KEEPER_API_HOST ?? "https://api.bitflowapis.finance",
-    KEEPER_API_URL: process.env.KEEPER_API_URL ?? "https://api.bitflowapis.finance",
+    KEEPER_API_HOST: process.env.KEEPER_API_HOST ?? "https://bff.bitflowapis.finance",
+    KEEPER_API_URL: process.env.KEEPER_API_URL ?? "https://bff.bitflowapis.finance",
     KEEPER_API_KEY: process.env.KEEPER_API_KEY ?? "",
     BITFLOW_PROVIDER_ADDRESS: process.env.BITFLOW_PROVIDER_ADDRESS ?? "",
   });
