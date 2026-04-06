@@ -26,7 +26,7 @@ No other skill in this registry combines news signal intelligence with Quantum R
 Five hard-coded gates execute in order before any swap:
 
 1. **Signal quality gate** — `signal_score < 60` → `status: "blocked"`. Derived from aibtc.news approved bitcoin-macro signals, 24h window, recency-weighted.
-2. **Quantum risk gate** — `(100 - readiness_index) / 100 × 0.1 > 0.15` → `status: "blocked"`. Quantum Power Map must show Readiness Index ≥ 25 before long-duration HODLMM allocation proceeds.
+2. **Quantum risk gate** — `(100 - readiness_index) / 100 × 0.2 > 0.15` → `status: "blocked"`. Quantum Power Map must show Readiness Index ≥ 25 before long-duration HODLMM allocation proceeds.
 3. **Spend cap** — `--amount-stx` hard-coded max: 500 STX. Amounts above this return `status: "blocked"`.
 4. **STX reserve** — wallet must retain ≥ 10 STX post-swap for gas. Refused if not satisfied.
 5. **Price impact** — Bitflow quote must show ≤ 1.5% price impact. Wider spreads return `status: "blocked"`.
