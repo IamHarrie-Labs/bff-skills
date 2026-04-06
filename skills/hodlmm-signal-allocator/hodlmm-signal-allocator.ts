@@ -173,23 +173,24 @@ async function fetchHodlmmPool(poolId: string): Promise<HodlmmPool | null> {
     // API returns { data: [...] } or [...] directly
     const pools: any[] = Array.isArray(resp) ? resp : (resp.data ?? []);
     const pool = pools.find((p: any) =>
-      (p.poolId ?? p.id ?? p.pool_id ?? "").toLowerCase() === poolId.toLowerCase()
+      (p.poolId ?? "").toLowerCase() === poolId.toLowerCase()
     );
     if (!pool) return null;
     const tx = pool.tokens ?? {};
     const tokenX = tx.tokenX ?? {};
     const tokenY = tx.tokenY ?? {};
+    // Field names verified against bff.bitflowapis.finance/api/app/v1/pools (2026-04-05)
     return {
-      id: pool.poolId ?? pool.id ?? poolId,
-      apr24h: parseFloat(pool.aprUsd1d ?? pool.apr24h ?? pool.apr_24h ?? pool.apr ?? 0),
-      tvlUsd: parseFloat(pool.tvlUsd ?? pool.tvl_usd ?? pool.tvl ?? 0),
-      tokenXSymbol: tokenX.symbol ?? pool.tokenXSymbol ?? "?",
-      tokenYSymbol: tokenY.symbol ?? pool.tokenYSymbol ?? "?",
-      tokenXPriceUsd: parseFloat(tokenX.priceUsd ?? pool.tokenXPriceUsd ?? 0),
-      tokenYPriceUsd: parseFloat(tokenY.priceUsd ?? pool.tokenYPriceUsd ?? 0),
-      tokenXDecimals: parseInt(tokenX.decimals ?? pool.tokenXDecimals ?? 6),
-      tokenYDecimals: parseInt(tokenY.decimals ?? pool.tokenYDecimals ?? 8),
-      activeBin: parseInt(pool.activeBin ?? pool.active_bin ?? 0),
+      id: pool.poolId,
+      apr24h: parseFloat(pool.apr24h ?? pool.apr ?? 0),
+      tvlUsd: parseFloat(pool.tvlUsd ?? 0),
+      tokenXSymbol: tokenX.symbol ?? "?",
+      tokenYSymbol: tokenY.symbol ?? "?",
+      tokenXPriceUsd: parseFloat(tokenX.priceUsd ?? 0),
+      tokenYPriceUsd: parseFloat(tokenY.priceUsd ?? 0),
+      tokenXDecimals: parseInt(tokenX.decimals ?? 6),
+      tokenYDecimals: parseInt(tokenY.decimals ?? 8),
+      activeBin: 0, // active_bin is in the quotes API; unused in allocation logic
     };
   } catch {
     return null;
