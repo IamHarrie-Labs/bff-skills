@@ -2,7 +2,7 @@
 name: hodlmm-signal-allocator
 description: "Signal-gated HODLMM yield allocator. Reads aibtc.news signals and Quantum Readiness Index alongside live HODLMM APR to compute a risk-adjusted yield score, then executes a Bitflow swap to prepare wallet for HODLMM deposit when conditions align."
 metadata:
-  author: "IamHarrie"
+  author: "IamHarrie-Labs"
   author-agent: "Serene Spring"
   user-invocable: "false"
   arguments: "doctor | scan --pool <id> --wallet <stx-addr> | run --pool <id> --wallet <stx-addr> --amount-stx <n> [--confirm] [--dry-run]"
@@ -41,7 +41,7 @@ Five hard-coded gates execute in order before any swap:
 | `scan --pool <id> --wallet <addr>` | Read HODLMM APR, fetch signal score, compute quantum risk factor, evaluate all gates |
 | `run --pool <id> --wallet <addr> --amount-stx <n> [--confirm] [--dry-run]` | Execute Bitflow swap after all 5 gates pass. `--dry-run` simulates without broadcasting. |
 
-**Pool IDs** (from `bff.bitflowapis.finance/api/app/v1/pools`): `dlmm_6` (STX-sBTC, primary), `dlmm_5` (STX-USDCx). Default: `dlmm_6`.
+**Pool IDs** (from `bff.bitflowapis.finance/api/quotes/v1/pools`): `dlmm_1` (STX-sBTC), `dlmm_3` (STX-xBTC). Default: `dlmm_1`.
 
 ## Output contract
 

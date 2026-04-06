@@ -173,23 +173,24 @@ async function fetchHodlmmPool(poolId: string): Promise<HodlmmPool | null> {
     // API returns { data: [...] } or [...] directly
     const pools: any[] = Array.isArray(resp) ? resp : (resp.data ?? []);
     const pool = pools.find((p: any) =>
-      (p.poolId ?? p.id ?? p.pool_id ?? "").toLowerCase() === poolId.toLowerCase()
+      (p.poolId ?? "").toLowerCase() === poolId.toLowerCase()
     );
     if (!pool) return null;
     const tx = pool.tokens ?? {};
     const tokenX = tx.tokenX ?? {};
     const tokenY = tx.tokenY ?? {};
+    // Field names verified against bff.bitflowapis.finance/api/app/v1/pools (2026-04-05)
     return {
-      id: pool.poolId ?? pool.id ?? poolId,
-      apr24h: parseFloat(pool.aprUsd1d ?? pool.apr24h ?? pool.apr_24h ?? pool.apr ?? 0),
-      tvlUsd: parseFloat(pool.tvlUsd ?? pool.tvl_usd ?? pool.tvl ?? 0),
-      tokenXSymbol: tokenX.symbol ?? pool.tokenXSymbol ?? "?",
-      tokenYSymbol: tokenY.symbol ?? pool.tokenYSymbol ?? "?",
-      tokenXPriceUsd: parseFloat(tokenX.priceUsd ?? pool.tokenXPriceUsd ?? 0),
-      tokenYPriceUsd: parseFloat(tokenY.priceUsd ?? pool.tokenYPriceUsd ?? 0),
-      tokenXDecimals: parseInt(tokenX.decimals ?? pool.tokenXDecimals ?? 6),
-      tokenYDecimals: parseInt(tokenY.decimals ?? pool.tokenYDecimals ?? 8),
-      activeBin: parseInt(pool.activeBin ?? pool.active_bin ?? 0),
+      id: pool.poolId,
+      apr24h: parseFloat(pool.apr24h ?? pool.apr ?? 0),
+      tvlUsd: parseFloat(pool.tvlUsd ?? 0),
+      tokenXSymbol: tokenX.symbol ?? "?",
+      tokenYSymbol: tokenY.symbol ?? "?",
+      tokenXPriceUsd: parseFloat(tokenX.priceUsd ?? 0),
+      tokenYPriceUsd: parseFloat(tokenY.priceUsd ?? 0),
+      tokenXDecimals: parseInt(tokenX.decimals ?? 6),
+      tokenYDecimals: parseInt(tokenY.decimals ?? 8),
+      activeBin: 0, // active_bin is in the quotes API; unused in allocation logic
     };
   } catch {
     return null;
@@ -256,11 +257,12 @@ async function fetchQuantumReadiness(): Promise<{ readiness_index: number; stale
 }
 
 function computeQuantumRiskFactor(readiness_index: number): number {
-  // Risk factor: 0.10 at index 0, 0.0 at index 100
-  // Scale: (100 - index) / 100 × 0.10
-  // At index 24: (100 - 24) / 100 × 0.10 = 0.076
-  // At index 50: (100 - 50) / 100 × 0.10 = 0.050
-  return parseFloat(((100 - readiness_index) / 100 * 0.10).toFixed(4));
+  // Risk factor: 0.20 at index 0, 0.0 at index 100
+  // Scale: (100 - index) / 100 × 0.20
+  // At index 25: (100 - 25) / 100 × 0.20 = 0.15  ← exactly hits MAX_QUANTUM_RISK_FACTOR gate
+  // At index 24: (100 - 24) / 100 × 0.20 = 0.152 ← blocks (aligns with AGENT.md "index ≥ 25 required")
+  // At index 50: (100 - 50) / 100 × 0.20 = 0.10
+  return parseFloat(((100 - readiness_index) / 100 * 0.20).toFixed(4));
 }
 
 // ─── Wallet balance helper ──────────────────────────────────────────────────────
@@ -268,7 +270,7 @@ function computeQuantumRiskFactor(readiness_index: number): number {
 async function getStxBalanceUstx(address: string): Promise<bigint> {
   try {
     const data = await fetchJson<any>(`${HIRO_API}/v2/accounts/${address}?proof=0`, 8_000);
-    return BigInt(parseInt(data.balance ?? "0", 16));
+    return BigInt("0x" + (data.balance ?? "0").replace(/^0x/, ""));
   } catch {
     return 0n;
   }
@@ -281,9 +283,9 @@ async function getSbtcBalance(address: string): Promise<number> {
       8_000
     );
     const fungible = data.fungible_tokens ?? {};
-    // sBTC contract principal varies; look for any key containing "sbtc" or "xbtc"
+    const SBTC_CONTRACT = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
     for (const key of Object.keys(fungible)) {
-      if (key.toLowerCase().includes("sbtc") || key.toLowerCase().includes("token::sbtc")) {
+      if (key.startsWith(SBTC_CONTRACT)) {
         return parseInt(fungible[key].balance ?? "0") / 1e8;
       }
     }
@@ -359,12 +361,12 @@ async function getWalletKeys(password: string): Promise<{ stxPrivateKey: string;
 async function getBitflowSDK(): Promise<any> {
   const { BitflowSDK } = await import("@bitflowlabs/core-sdk" as any);
   return new BitflowSDK({
-    BITFLOW_API_HOST: process.env.BITFLOW_API_HOST ?? "https://api.bitflowapis.finance",
+    BITFLOW_API_HOST: process.env.BITFLOW_API_HOST ?? "https://bff.bitflowapis.finance",
     BITFLOW_API_KEY: process.env.BITFLOW_API_KEY ?? "",
     READONLY_CALL_API_HOST: HIRO_API,
     READONLY_CALL_API_KEY: process.env.READONLY_CALL_API_KEY ?? "",
-    KEEPER_API_HOST: process.env.KEEPER_API_HOST ?? "https://api.bitflowapis.finance",
-    KEEPER_API_URL: process.env.KEEPER_API_URL ?? "https://api.bitflowapis.finance",
+    KEEPER_API_HOST: process.env.KEEPER_API_HOST ?? "https://bff.bitflowapis.finance",
+    KEEPER_API_URL: process.env.KEEPER_API_URL ?? "https://bff.bitflowapis.finance",
     KEEPER_API_KEY: process.env.KEEPER_API_KEY ?? "",
     BITFLOW_PROVIDER_ADDRESS: process.env.BITFLOW_PROVIDER_ADDRESS ?? "",
   });
@@ -796,7 +798,15 @@ program
       status: isLiveDryRun ? "dry-run" : "completed",
       error_message: null,
     };
-    appendExecution(record);
+    // Only update cooldown timer for live executions — dry-run must not block real execution
+    if (!isLiveDryRun) {
+      appendExecution(record);
+    } else {
+      // Log dry-run to execution_log for audit trail but do not touch last_exec_ts
+      const state = readState();
+      state.execution_log = [...state.execution_log, record].slice(-50);
+      writeState(state);
+    }
 
     const adjusted_apr = parseFloat((poolData.apr24h * (1 - quantum_risk_factor)).toFixed(4));
 
