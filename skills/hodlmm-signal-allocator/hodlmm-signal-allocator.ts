@@ -201,7 +201,7 @@ async function fetchHodlmmPool(poolId: string): Promise<HodlmmPool | null> {
 
 async function fetchBitcoinMacroSignals(): Promise<AibtcSignal[]> {
   const since = new Date(Date.now() - SIGNAL_LOOKBACK_MS).toISOString();
-  const url = `${AIBTC_SIGNALS_API}?beat=btc-macro&status=approved&limit=30&since=${encodeURIComponent(since)}`;
+  const url = `${AIBTC_SIGNALS_API}?beat=bitcoin-macro&status=approved&limit=30&since=${encodeURIComponent(since)}`;
   try {
     const data = await fetchJson<any>(url);
     const signals: AibtcSignal[] = (data.signals ?? data ?? []).map((s: any) => ({
@@ -476,7 +476,7 @@ program
     const [bitflowQuotes, bitflowApp, aibtcSignals] = await Promise.all([
       checkUrl(`${BITFLOW_QUOTES_API}/pools`),
       checkUrl(`${BITFLOW_APP_API}/pools`),
-      checkUrl(`${AIBTC_SIGNALS_API}?beat=btc-macro&limit=1`),
+      checkUrl(`${AIBTC_SIGNALS_API}?beat=bitcoin-macro&limit=1`),
     ]);
 
     checks.bitflow_quotes = bitflowQuotes;
