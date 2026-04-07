@@ -502,7 +502,7 @@ program
       : degraded.length > 0 ? "degraded"
       : "ok";
 
-    if (overallStatus === "down" || overallStatus === "missing") {
+    if (overallStatus === "down" || hasMissing) {
       fail(
         "DEPENDENCY_DOWN",
         `Required dependencies unavailable: ${allDown.join(", ")}${hasMissing ? ", bitflow_sdk" : ""}`,
