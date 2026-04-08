@@ -682,6 +682,101 @@ program
     if (!allOk) process.exit(1);
   });
 
+// ── scan ────────────────────────────────────────────────────────────────────────
+
+program
+  .command("scan")
+  .description("Scan all HODLMM pools and rank by deployment attractiveness (APR, volume, gate status)")
+  .option("--wallet <addr>", "Stacks wallet address (SP...) — if provided, checks existing positions")
+  .option("--amount-stx <n>", "STX amount to model for balance gate", "100")
+  .action(async (opts: { wallet?: string; amountStx: string }) => {
+    const amountStx = parseFloat(opts.amountStx);
+
+    // Fetch all pools from app API
+    let allPools: PoolInfo[] = [];
+    try {
+      const resp = await fetchJson<any>(`${BITFLOW_APP_API}/pools`);
+      const appPools: any[] = Array.isArray(resp) ? resp : (resp.data ?? []);
+      const quotesResp = await fetchJson<any>(`${BITFLOW_QUOTES_API}/pools`);
+      const quotesPools: any[] = quotesResp.pools ?? quotesResp ?? [];
+
+      for (const ap of appPools) {
+        const qp = quotesPools.find((p: any) => p.pool_id === ap.poolId);
+        if (!qp) continue;
+        const tx = ap.tokens ?? {};
+        const tokenX = tx.tokenX ?? {};
+        const tokenY = tx.tokenY ?? {};
+        allPools.push({
+          pool_id:           ap.poolId,
+          active_bin:        qp.active_bin ?? 0,
+          bin_step:          qp.bin_step ?? 25,
+          token_x:           qp.token_x ?? "",
+          token_y:           qp.token_y ?? "",
+          tvl_usd:           parseFloat(ap.tvlUsd ?? 0),
+          volume_24h_usd:    parseFloat(ap.volumeUsd1d ?? ap.volumeUsd24h ?? 0),
+          apr_24h:           parseFloat(ap.apr24h ?? ap.apr ?? 0),
+          token_x_price_usd: parseFloat(tokenX.priceUsd ?? 0),
+          token_y_price_usd: parseFloat(tokenY.priceUsd ?? 0),
+          token_x_decimals:  parseInt(tokenX.decimals ?? 8),
+          token_y_decimals:  parseInt(tokenY.decimals ?? 6),
+          fee_bps:           parseFloat(qp.x_total_fee_bps ?? qp.fee_bps ?? 30),
+        });
+      }
+    } catch (e: any) {
+      return fail("SCAN_FAILED", `Could not fetch pool list: ${e.message}`, "Run doctor to check API connectivity");
+    }
+
+    const balanceUstx = opts.wallet ? await getStxBalanceUstx(opts.wallet) : 0n;
+    const balanceStx  = Number(balanceUstx) / 1_000_000;
+
+    // Score and rank each pool
+    const ranked = allPools
+      .filter((p) => p.volume_24h_usd > 0 || p.apr_24h > 0)
+      .map((pool) => {
+        const deployedUsd  = amountStx * (pool.token_y_price_usd || 1);
+        const estApy       = estimateFeeApy(deployedUsd, pool);
+        const gates = {
+          volume_ok:  pool.volume_24h_usd >= MIN_VOLUME_24H_USD,
+          apr_ok:     pool.apr_24h >= MIN_APR_PCT,
+          balance_ok: !opts.wallet || (balanceStx >= amountStx + MIN_STX_RESERVE),
+        };
+        const gatesPassCount = Object.values(gates).filter(Boolean).length;
+        // Score: APR × volume weight × gate bonus
+        const score = pool.apr_24h * Math.log10(Math.max(pool.volume_24h_usd, 1)) * (gatesPassCount / 3);
+        return {
+          pool_id:        pool.pool_id,
+          active_bin:     pool.active_bin,
+          apr_24h_pct:    pool.apr_24h,
+          volume_24h_usd: Math.round(pool.volume_24h_usd),
+          tvl_usd:        Math.round(pool.tvl_usd),
+          est_apy_pct:    estApy,
+          gates,
+          gates_pass:     gatesPassCount,
+          deploy_ready:   gatesPassCount === 3,
+          score:          parseFloat(score.toFixed(2)),
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const best = ranked.find((p) => p.deploy_ready) ?? ranked[0];
+
+    success(
+      best?.deploy_ready
+        ? `BEST_POOL: ${best.pool_id} — APR ${best.apr_24h_pct.toFixed(2)}%, vol $${best.volume_24h_usd.toLocaleString()}, est APY ${best.est_apy_pct}%`
+        : `SCAN_COMPLETE — ${ranked.length} pools ranked, none fully gate-ready${opts.wallet ? " (check wallet balance)" : " (provide --wallet for balance gate)"}`,
+      {
+        pools_scanned: allPools.length,
+        pools_ranked:  ranked.length,
+        best_pool:     best ?? null,
+        all_pools:     ranked,
+        wallet:        opts.wallet ? { address: opts.wallet, balance_stx: parseFloat(balanceStx.toFixed(4)) } : null,
+        recommendation: best?.deploy_ready
+          ? `Run: analyze --pool-id ${best.pool_id}${opts.wallet ? ` --wallet ${opts.wallet}` : ""} --amount-stx ${amountStx}`
+          : "No pool meets all deployment gates. Check wallet balance or wait for higher pool activity.",
+      }
+    );
+  });
+
 // ── analyze ─────────────────────────────────────────────────────────────────────
 
 program

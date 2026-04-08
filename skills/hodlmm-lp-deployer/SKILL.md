@@ -5,7 +5,7 @@ metadata:
   author: "IamHarrie-Labs"
   author-agent: "Serene Spring"
   user-invocable: "false"
-  arguments: "doctor | analyze --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>] | deploy --pool-id <id> --wallet <addr> --amount-stx <n> [--range-width <bins>] [--confirm] [--dry-run] | withdraw --pool-id <id> --wallet <addr> [--confirm] [--dry-run] | rebalance --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>] [--confirm] [--dry-run]"
+  arguments: "doctor | scan [--wallet <addr>] [--amount-stx <n>] | analyze --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>] | deploy --pool-id <id> --wallet <addr> --amount-stx <n> [--range-width <bins>] [--confirm] [--dry-run] | withdraw --pool-id <id> --wallet <addr> [--confirm] [--dry-run] | rebalance --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>] [--confirm] [--dry-run]"
   entry: "hodlmm-lp-deployer/hodlmm-lp-deployer.ts"
   requires: ""
   tags: "defi, write, mainnet-only, requires-funds, l2, hodlmm"
@@ -44,12 +44,13 @@ State is persisted to `~/.hodlmm-lp-deployer-state.json` (cooldown timestamps, d
 | Command | Description |
 |---|---|
 | `doctor` | Health check: Bitflow App API, Quotes API, Hiro API, Bitflow SDK LP methods, wallet, state file |
+| `scan [--wallet <addr>] [--amount-stx <n>]` | Rank all HODLMM pools by deployment attractiveness (APR × volume × gate status). Identifies best entry pool. |
 | `analyze --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>]` | Inspect pool, current position, compute bin range, estimate fee APY, evaluate all gates |
 | `deploy --pool-id <id> --wallet <addr> --amount-stx <n> [--range-width <bins>] [--confirm] [--dry-run]` | Deploy STX into HODLMM bins. Requires `--confirm`. Uses Bitflow SDK LP methods with DEPLOY_READY fallback. |
 | `withdraw --pool-id <id> --wallet <addr> [--confirm] [--dry-run]` | Remove all LP liquidity from pool position. Requires `--confirm`. |
 | `rebalance --pool-id <id> --wallet <addr> [--amount-stx <n>] [--range-width <bins>] [--confirm] [--dry-run]` | Detect out-of-range position, withdraw, and re-deploy centered on current active bin. Blocked if in-range. |
 
-**Pool IDs:** `dlmm_1` (STX-sBTC, recommended), `dlmm_3` (STX-xBTC). Discover others via `doctor`.
+**Pool IDs (live):** `dlmm_3` (STX-xBTC, $204k vol, 7.95% APR — most active), `dlmm_1` (STX-sBTC). Use `scan` to discover and rank all pools.
 
 **LP Strategy:** STX-only single-sided liquidity. Deploys in bins `[activeBin - rangeWidth, activeBin]`. No sBTC required. Earns fees from all sBTC→STX swaps through these bins.
 
