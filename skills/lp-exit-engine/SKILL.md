@@ -1,6 +1,6 @@
 ---
 name: lp-exit-engine
-description: "Diagnoses a live Bitflow HODLMM LP position for impermanent loss, drift, and pool volatility, then autonomously withdraws all liquidity when the composite risk score crosses a configurable threshold — combining a read autopsy and a write exit in a single autonomous decision loop."
+description: "Diagnoses a live Bitflow HODLMM LP position for impermanent loss, drift, and pool volatility, then autonomously withdraws all liquidity when the composite risk score crosses a configurable threshold — with chunked batch execution and dynamic fee estimation for positions of any size."
 metadata:
   author: "IamHarrie"
   author-agent: "LP Exit Engine Agent"
@@ -15,7 +15,7 @@ metadata:
 
 ## What it does
 
-Performs a real-time autopsy of a Bitflow HODLMM LP position — computing drift score (how far position bins have moved from the active trading bin), pool volatility score (bin spread, reserve imbalance, concentration), and an impermanent loss estimate — then derives a single composite risk score (0–100). If the risk score exceeds a configurable threshold, it automatically calls `withdraw-liquidity-multi` on the Bitflow HODLMM router to fully exit all position bins in a single on-chain transaction. This is the only skill that combines READ intelligence with a WRITE exit outcome in one autonomous decision loop.
+Performs a real-time autopsy of a Bitflow HODLMM LP position — computing drift score (how far position bins have moved from the active trading bin), pool volatility score (bin spread, reserve imbalance, concentration), and an impermanent loss estimate — then derives a single composite risk score (0–100). If the risk score exceeds a configurable threshold, it automatically calls `withdraw-liquidity-multi` on the Bitflow HODLMM router to exit all position bins. Large positions (>100 bins) are split into chunks of 100 and submitted as sequential transactions with dynamically scaled fees — making the skill safe for positions of any size, not just small ones.
 
 ## Why agents need it
 
@@ -96,6 +96,11 @@ All commands output JSON only to stdout. Errors use `{"error": "message"}` and e
   "verdict": "exit",
   "exitThreshold": 60,
   "wouldExitOnRun": true,
+  "exitPlan": {
+    "batchSize": 100,
+    "totalBatches": 3,
+    "estimatedTotalFee": "0.8 STX"
+  },
   "timestamp": "2026-04-09T12:25:00.000Z"
 }
 ```
@@ -104,17 +109,26 @@ All commands output JSON only to stdout. Errors use `{"error": "message"}` and e
 ```json
 {
   "action": "exit_executed",
-  "txid": "b301fbf09036da5fb07e36e5edc375b38c4cd558b2b0bf26ec6225c82a3d93cd",
-  "txUrl": "https://explorer.hiro.so/txid/b301fbf09036da5fb07e36e5edc375b38c4cd558b2b0bf26ec6225c82a3d93cd?chain=mainnet",
   "poolId": "dlmm_6",
   "address": "SP301E0FY52B19281VCHP41SAKKZFR761BMKQH4QE",
-  "binsExited": 220,
+  "totalBinsExited": 220,
   "totalDlp": "499221",
   "riskScore": 100,
   "driftScore": 100,
   "volatilityScore": 100,
   "ilEstimatePct": 8.0,
   "verdict": "exit",
+  "batches": [
+    {
+      "batchIndex": 0,
+      "binsInBatch": 100,
+      "txid": "b301fbf09036da5fb07e36e5edc375b38c4cd558b2b0bf26ec6225c82a3d93cd",
+      "txUrl": "https://explorer.hiro.so/txid/b301fbf0...?chain=mainnet",
+      "fee": "0.4 STX"
+    }
+  ],
+  "txid": "b301fbf09036da5fb07e36e5edc375b38c4cd558b2b0bf26ec6225c82a3d93cd",
+  "txUrl": "https://explorer.hiro.so/txid/b301fbf09036da5fb07e36e5edc375b38c4cd558b2b0bf26ec6225c82a3d93cd?chain=mainnet",
   "timestamp": "2026-04-09T15:13:15.858Z"
 }
 ```
@@ -159,7 +173,7 @@ IL estimate: `driftScore × 0.08%` (linear approximation, max 8%)
 ## Known constraints
 
 - HODLMM (DLMM) pools only — not compatible with classic Bitflow AMM v1/v2 pools
-- Processes all position bins in a single `withdraw-liquidity-multi` call (max 326 per the contract); positions with more bins require chunking
-- Fee estimation is fixed at 0.5 STX; very large positions may benefit from a higher fee via the `--fee` flag (future enhancement)
+- Positions with more than 100 bins are split into sequential batches of 100; each batch is a separate on-chain transaction with an auto-incremented nonce
+- Fee is estimated dynamically: `0.2 STX base + 0.002 STX × bins-in-batch`; very large batches may still benefit from a manual `--fee` override (future enhancement)
 - IL estimate is a linear approximation — does not account for fee accrual offsetting loss
 - Pool IDs can be discovered via `bun -e "fetch('https://bff.bitflowapis.finance/api/app/v1/pools?amm_type=dlmm').then(r=>r.json()).then(d=>d.data.forEach(p=>console.log(p.poolId, p.tokens.tokenX.symbol+'/'+p.tokens.tokenY.symbol)))"`

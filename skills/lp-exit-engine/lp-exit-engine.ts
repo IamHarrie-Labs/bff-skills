@@ -9,8 +9,15 @@
  *   status  — Read-only autopsy: IL estimate, drift, risk score, verdict
  *   run     — Execute exit if risk >= threshold; dry run without --confirm
  *
+ * Features:
+ *   - Chunked batch withdrawal: splits large positions into batches of
+ *     BATCH_SIZE bins, each submitted as a separate tx with sequential nonces
+ *   - Dynamic fee estimation: scales fee with batch size so large positions
+ *     always have enough gas
+ *   - Per-bin reserve direction: correctly sets min-x / min-y per bin based
+ *     on live pool state (no blanket zero minimums)
+ *
  * HODLMM bonus eligible: Yes — directly interacts with HODLMM pools.
- * Self-contained: no external deps beyond @stacks/transactions + commander.
  */
 
 import { Command } from "commander";
@@ -43,10 +50,20 @@ const ROUTER_ADDR = "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD";
 const ROUTER_CONTRACT = "dlmm-liquidity-router-v-1-1";
 const FETCH_TIMEOUT_MS = 30_000;
 const DEFAULT_THRESHOLD = 60;
-const TX_FEE = 500_000n; // 0.5 STX — large multi-bin withdrawals need higher fee
+
+// Chunking: max bins per tx (well under the contract's 326 limit)
+const BATCH_SIZE = 100;
+
+// Fee scaling: base fee + per-bin increment (microSTX)
+// Base 200k covers overhead; 2k per bin covers extra computation/storage
+const FEE_BASE = 200_000n;
+const FEE_PER_BIN = 2_000n;
+
+// Minimum STX buffer kept in wallet after fees
+const FEE_BUFFER = 50_000n;
 
 // ---------------------------------------------------------------------------
-// Types (matches real Bitflow API shapes)
+// Types
 // ---------------------------------------------------------------------------
 interface TokenInfo {
   contract: string;
@@ -68,7 +85,6 @@ interface BinData {
   bin_id: number;
   reserve_x: string;
   reserve_y: string;
-  // position endpoint field names vary — handle all observed variants
   user_liquidity?: string;
   userLiquidity?: string | number;
   liquidity?: string | number;
@@ -86,6 +102,34 @@ interface RiskMetrics {
   ilEstimatePct: number;
   avgOffset: number;
   verdict: "hold" | "rebalance" | "exit";
+}
+
+interface BatchResult {
+  batchIndex: number;
+  binsInBatch: number;
+  txid: string;
+  txUrl: string;
+  fee: string;
+}
+
+// ---------------------------------------------------------------------------
+// Fee estimation
+// ---------------------------------------------------------------------------
+function estimateFee(binCount: number): bigint {
+  return FEE_BASE + FEE_PER_BIN * BigInt(binCount);
+}
+
+function estimateTotalFees(totalBins: number): bigint {
+  const batches = Math.ceil(totalBins / BATCH_SIZE);
+  // Each batch of BATCH_SIZE (or fewer) bins gets its own fee
+  let total = 0n;
+  let remaining = totalBins;
+  for (let i = 0; i < batches; i++) {
+    const batchBins = Math.min(remaining, BATCH_SIZE);
+    total += estimateFee(batchBins);
+    remaining -= batchBins;
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +163,6 @@ async function getUserPositionBins(
   address: string,
   poolId: string
 ): Promise<BinData[]> {
-  // 404 means no position in this pool — convert to a clean error
   let res: unknown;
   try {
     res = await fetchJson<unknown>(
@@ -154,20 +197,18 @@ async function getNonce(address: string): Promise<bigint> {
 }
 
 // ---------------------------------------------------------------------------
-// Wallet — supports STACKS_PRIVATE_KEY, STACKS_MNEMONIC, or .wallet file
+// Wallet
 // ---------------------------------------------------------------------------
 async function deriveFromMnemonic(mnemonic: string): Promise<{ privateKey: string; address: string }> {
-  // Normalise: collapse whitespace so copy-paste artifacts don't break word count
   const clean = mnemonic.replace(/\s+/g, " ").trim();
   const wallet = await generateWallet({ secretKey: clean, password: "" });
   const account = wallet.accounts[0];
-  const privateKey = account.stxPrivateKey; // keep compression flag (01 suffix)
+  const privateKey = account.stxPrivateKey;
   const address = getAddressFromPrivateKey(privateKey, TransactionVersion.Mainnet);
   return { privateKey, address };
 }
 
 async function loadWallet(): Promise<{ privateKey: string; address: string }> {
-  // Option 1: raw private key
   const rawKey = process.env.STACKS_PRIVATE_KEY;
   if (rawKey) {
     const cleanKey = rawKey.startsWith("0x") ? rawKey.slice(2) : rawKey;
@@ -175,13 +216,11 @@ async function loadWallet(): Promise<{ privateKey: string; address: string }> {
     return { privateKey: cleanKey, address };
   }
 
-  // Option 2: env var mnemonic
   const envMnemonic = process.env.STACKS_MNEMONIC;
   if (envMnemonic) {
     return deriveFromMnemonic(envMnemonic.trim());
   }
 
-  // Option 3: .wallet file in working directory (avoids shell quoting issues)
   const walletFile = join(process.cwd(), ".wallet");
   if (existsSync(walletFile)) {
     const fileMnemonic = readFileSync(walletFile, "utf8").trim();
@@ -189,10 +228,7 @@ async function loadWallet(): Promise<{ privateKey: string; address: string }> {
   }
 
   throw new Error(
-    "No wallet found. Either:\n" +
-    "  1. Create a .wallet file with your seed phrase, or\n" +
-    "  2. Set STACKS_MNEMONIC env var, or\n" +
-    "  3. Set STACKS_PRIVATE_KEY env var"
+    "No wallet found. Set STACKS_MNEMONIC, STACKS_PRIVATE_KEY, or create a .wallet file."
   );
 }
 
@@ -205,7 +241,6 @@ function computeRiskMetrics(
   positionBins: BinData[],
   threshold: number
 ): RiskMetrics {
-  // Drift: how far position bins are from the active bin
   const offsets = positionBins.map((b) => Math.abs(b.bin_id - activeBinId));
   const avgOffset =
     offsets.length > 0
@@ -213,7 +248,6 @@ function computeRiskMetrics(
       : 0;
   const driftScore = Math.round(Math.min(avgOffset * 5, 100));
 
-  // Volatility: pool health from bin spread + reserve imbalance + concentration
   let volatilityScore = 0;
   const nonEmpty = poolBins.filter(
     (b) => Number(b.reserve_x) > 0 || Number(b.reserve_y) > 0
@@ -222,8 +256,7 @@ function computeRiskMetrics(
     const ids = nonEmpty.map((b) => b.bin_id);
     const binSpread =
       (Math.max(...ids) - Math.min(...ids)) / Math.max(poolBins.length, 1);
-    let totalX = 0,
-      totalY = 0;
+    let totalX = 0, totalY = 0;
     for (const b of poolBins) {
       totalX += Number(b.reserve_x);
       totalY += Number(b.reserve_y);
@@ -237,15 +270,12 @@ function computeRiskMetrics(
     const concentration = total > 0 ? activeLiq / total : 0;
     volatilityScore = Math.round(
       Math.min(
-        Math.min(binSpread * 100, 40) +
-          imbalance * 30 +
-          (1 - concentration) * 30,
+        Math.min(binSpread * 100, 40) + imbalance * 30 + (1 - concentration) * 30,
         100
       )
     );
   }
 
-  // Composite: drift weighted heavier (position health > pool state)
   const riskScore = Math.round(driftScore * 0.6 + volatilityScore * 0.4);
   const ilEstimatePct = Number((driftScore * 0.08).toFixed(2));
   const verdict: RiskMetrics["verdict"] =
@@ -255,27 +285,12 @@ function computeRiskMetrics(
 }
 
 // ---------------------------------------------------------------------------
-// Exit transaction
+// Exit transaction — single batch
 // ---------------------------------------------------------------------------
-async function getChainActiveBinSigned(poolContract: string): Promise<bigint> {
-  const [addr, name] = poolContract.split(".");
-  const res = await fetchJson<{ result: string }>(
-    `${HIRO_API}/v2/contracts/call-read/${addr}/${name}/get-active-bin-id`,
-    "POST",
-    { sender: addr, arguments: [] }
-  );
-  // (ok int128) = 0x07 00 + 16 bytes signed big-endian
-  const raw = res.result.slice(6); // strip "0700"
-  const val = BigInt("0x" + raw);
-  const maxInt128 = BigInt("0x80000000000000000000000000000000");
-  return val >= maxInt128 ? val - BigInt("0x100000000000000000000000000000000") : val;
-}
-
-async function executeExit(
+async function executeBatch(
   pool: PoolInfo,
   bins: BinData[],
-  poolBins: BinData[],    // full pool bins — used to determine reserve direction per bin
-  _activeBinId: number,   // API value kept for metrics only
+  poolBinMap: Map<number, { rx: bigint; ry: bigint }>,
   privateKey: string,
   nonce: bigint
 ): Promise<string> {
@@ -283,31 +298,17 @@ async function executeExit(
   const [xAddr, xName] = pool.tokens.tokenX.contract.split(".");
   const [yAddr, yName] = pool.tokens.tokenY.contract.split(".");
 
-  // Build a lookup of pool-level reserves per bin_id
-  const poolBinMap = new Map<number, { rx: bigint; ry: bigint }>();
-  for (const pb of poolBins) {
-    poolBinMap.set(pb.bin_id, {
-      rx: BigInt(String(pb.reserve_x ?? "0")),
-      ry: BigInt(String(pb.reserve_y ?? "0")),
-    });
-  }
-
-  // Use withdraw-liquidity-multi with absolute signed bin-ids.
-  // Per bin we set min amounts based on pool reserve direction:
-  //   bins below active → only X reserves   → min-x-amount=1, min-y-amount=0
-  //   bins above active → only Y reserves   → min-x-amount=0, min-y-amount=1
-  //   active bin        → both              → min-x-amount=1, min-y-amount=0
-  // The contract requires min-x + min-y > 0, so we always set one of them to 1.
   const CENTER = 500n;
+  const fee = estimateFee(bins.length);
 
   const positionList = bins.flatMap((bin) => {
     const dlp = BigInt(String(bin.userLiquidity ?? bin.user_liquidity ?? bin.liquidity ?? "0"));
-    if (dlp === 0n) return []; // skip empty bins silently
+    if (dlp === 0n) return [];
 
-    // signed bin-id = api_bin_id - CENTER (e.g. bin 199 → -301)
     const signedBinId = BigInt(bin.bin_id) - CENTER;
 
-    // Determine which side has reserves
+    // Set min amounts based on which side of the active bin this bin is on.
+    // The contract requires min-x-amount + min-y-amount > 0.
     const pr = poolBinMap.get(bin.bin_id);
     const hasX = pr ? pr.rx > 0n : true;
     const hasY = pr ? pr.ry > 0n : false;
@@ -325,6 +326,8 @@ async function executeExit(
     })];
   });
 
+  if (positionList.length === 0) throw new Error("Batch has no withdrawable bins");
+
   const tx = await makeContractCall({
     contractAddress: ROUTER_ADDR,
     contractName: ROUTER_CONTRACT,
@@ -334,12 +337,58 @@ async function executeExit(
     network: STACKS_MAINNET,
     postConditionMode: PostConditionMode.Allow,
     nonce,
-    fee: TX_FEE,
+    fee,
   });
 
   const result = await broadcastTransaction(tx, STACKS_MAINNET);
   if ("error" in result) throw new Error(`Broadcast failed: ${result.error}`);
   return result.txid;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked exit — splits bins into batches, submits with sequential nonces
+// ---------------------------------------------------------------------------
+async function executeExit(
+  pool: PoolInfo,
+  bins: BinData[],
+  poolBins: BinData[],
+  privateKey: string,
+  nonce: bigint
+): Promise<BatchResult[]> {
+  // Build reserve direction map once
+  const poolBinMap = new Map<number, { rx: bigint; ry: bigint }>();
+  for (const pb of poolBins) {
+    poolBinMap.set(pb.bin_id, {
+      rx: BigInt(String(pb.reserve_x ?? "0")),
+      ry: BigInt(String(pb.reserve_y ?? "0")),
+    });
+  }
+
+  // Split into chunks
+  const batches: BinData[][] = [];
+  for (let i = 0; i < bins.length; i += BATCH_SIZE) {
+    batches.push(bins.slice(i, i + BATCH_SIZE));
+  }
+
+  const results: BatchResult[] = [];
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchNonce = nonce + BigInt(i);
+    const fee = estimateFee(batch.length);
+
+    const txid = await executeBatch(pool, batch, poolBinMap, privateKey, batchNonce);
+
+    results.push({
+      batchIndex: i,
+      binsInBatch: batch.length,
+      txid,
+      txUrl: `https://explorer.hiro.so/txid/${txid}?chain=mainnet`,
+      fee: `${Number(fee) / 1_000_000} STX`,
+    });
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,9 +413,10 @@ program
   .name("lp-exit-engine")
   .description(
     "Bitflow HODLMM LP Position Autopsy + Exit Engine — " +
-      "diagnose positions for IL/drift risk and autonomously execute exits"
+      "diagnose positions for IL/drift risk and autonomously execute exits " +
+      "with chunked batching and dynamic fee estimation"
   )
-  .version("1.0.0");
+  .version("2.0.0");
 
 // ---------------------------------------------------------------------------
 // doctor
@@ -401,8 +451,7 @@ program
     }
 
     const ready =
-      typeof checks["bitflow_api"] === "string" &&
-      checks["hiro_api"] === true;
+      typeof checks["bitflow_api"] === "string" && checks["hiro_api"] === true;
     printJson({ checks, ready });
   });
 
@@ -411,215 +460,211 @@ program
 // ---------------------------------------------------------------------------
 program
   .command("status")
-  .description(
-    "Read-only position autopsy: drift, IL estimate, volatility, risk score, verdict"
-  )
+  .description("Read-only position autopsy: drift, IL estimate, volatility, risk score, verdict")
   .requiredOption("--pool-id <id>", "HODLMM pool ID (e.g. dlmm_1)")
   .requiredOption("--address <addr>", "Stacks wallet address to inspect")
-  .option(
-    "--threshold <score>",
-    "Exit threshold override (0–100)",
-    String(DEFAULT_THRESHOLD)
-  )
-  .action(
-    async (opts: { poolId: string; address: string; threshold: string }) => {
-      try {
-        const threshold = parseInt(opts.threshold, 10);
-        if (isNaN(threshold) || threshold < 0 || threshold > 100) {
-          throw new Error("--threshold must be an integer 0–100");
-        }
-
-        const [pool, binsRes, positionBins] = await Promise.all([
-          getPool(opts.poolId),
-          getPoolBins(opts.poolId),
-          getUserPositionBins(opts.address, opts.poolId),
-        ]);
-
-        if (!positionBins.length) {
-          throw new Error("Position returned no bins");
-        }
-
-        const activeBinId = binsRes.active_bin_id;
-        if (activeBinId == null) throw new Error("Cannot determine active bin ID");
-
-        const totalDlp = positionBins.reduce(
-          (sum, b) =>
-            sum + BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")),
-          0n
-        );
-
-        const m = computeRiskMetrics(
-          activeBinId,
-          binsRes.bins,
-          positionBins,
-          threshold
-        );
-
-        printJson({
-          network: "mainnet",
-          poolId: opts.poolId,
-          address: opts.address,
-          tokenX: pool.tokens.tokenX.symbol ?? pool.tokens.tokenX.contract,
-          tokenY: pool.tokens.tokenY.symbol ?? pool.tokens.tokenY.contract,
-          activeBinId,
-          positionBinCount: positionBins.length,
-          totalDlp: String(totalDlp),
-          avgBinOffset: Number(m.avgOffset.toFixed(2)),
-          driftScore: m.driftScore,
-          volatilityScore: m.volatilityScore,
-          riskScore: m.riskScore,
-          ilEstimatePct: m.ilEstimatePct,
-          verdict: m.verdict,
-          exitThreshold: threshold,
-          wouldExitOnRun: m.riskScore >= threshold,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (error) {
-        handleError(error);
+  .option("--threshold <score>", "Exit threshold override (0–100)", String(DEFAULT_THRESHOLD))
+  .action(async (opts: { poolId: string; address: string; threshold: string }) => {
+    try {
+      const threshold = parseInt(opts.threshold, 10);
+      if (isNaN(threshold) || threshold < 0 || threshold > 100) {
+        throw new Error("--threshold must be an integer 0–100");
       }
+
+      const [pool, binsRes, positionBins] = await Promise.all([
+        getPool(opts.poolId),
+        getPoolBins(opts.poolId),
+        getUserPositionBins(opts.address, opts.poolId),
+      ]);
+
+      if (!positionBins.length) throw new Error("Position returned no bins");
+
+      const activeBinId = binsRes.active_bin_id;
+      if (activeBinId == null) throw new Error("Cannot determine active bin ID");
+
+      const exitBins = positionBins.filter(
+        (b) => BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")) > 0n
+      );
+
+      const totalDlp = exitBins.reduce(
+        (sum, b) => sum + BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")),
+        0n
+      );
+
+      const m = computeRiskMetrics(activeBinId, binsRes.bins, positionBins, threshold);
+
+      // Fee plan
+      const batches = Math.ceil(exitBins.length / BATCH_SIZE);
+      const totalFee = estimateTotalFees(exitBins.length);
+
+      printJson({
+        network: "mainnet",
+        poolId: opts.poolId,
+        address: opts.address,
+        tokenX: pool.tokens.tokenX.symbol ?? pool.tokens.tokenX.contract,
+        tokenY: pool.tokens.tokenY.symbol ?? pool.tokens.tokenY.contract,
+        activeBinId,
+        positionBinCount: positionBins.length,
+        totalDlp: String(totalDlp),
+        avgBinOffset: Number(m.avgOffset.toFixed(2)),
+        driftScore: m.driftScore,
+        volatilityScore: m.volatilityScore,
+        riskScore: m.riskScore,
+        ilEstimatePct: m.ilEstimatePct,
+        verdict: m.verdict,
+        exitThreshold: threshold,
+        wouldExitOnRun: m.riskScore >= threshold,
+        exitPlan: {
+          batchSize: BATCH_SIZE,
+          totalBatches: batches,
+          estimatedTotalFee: `${Number(totalFee) / 1_000_000} STX`,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      handleError(error);
     }
-  );
+  });
 
 // ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------
 program
   .command("run")
-  .description(
-    "Execute exit if risk score >= threshold. Dry run by default — add --confirm to write on-chain"
-  )
+  .description("Execute exit if risk score >= threshold. Dry run by default — add --confirm to write on-chain")
   .requiredOption("--pool-id <id>", "HODLMM pool ID")
   .requiredOption("--address <addr>", "Stacks wallet address (must match loaded wallet)")
-  .option(
-    "--threshold <score>",
-    `Exit score threshold 0–100 (default ${DEFAULT_THRESHOLD})`,
-    String(DEFAULT_THRESHOLD)
-  )
+  .option("--threshold <score>", `Exit score threshold 0–100 (default ${DEFAULT_THRESHOLD})`, String(DEFAULT_THRESHOLD))
   .option("--confirm", "Execute the on-chain withdrawal (omit for dry run)")
-  .action(
-    async (opts: {
-      poolId: string;
-      address: string;
-      threshold: string;
-      confirm?: boolean;
-    }) => {
-      try {
-        const threshold = parseInt(opts.threshold, 10);
-        if (isNaN(threshold) || threshold < 0 || threshold > 100) {
-          throw new Error("--threshold must be an integer 0–100");
-        }
+  .action(async (opts: {
+    poolId: string;
+    address: string;
+    threshold: string;
+    confirm?: boolean;
+  }) => {
+    try {
+      const threshold = parseInt(opts.threshold, 10);
+      if (isNaN(threshold) || threshold < 0 || threshold > 100) {
+        throw new Error("--threshold must be an integer 0–100");
+      }
 
-        const [pool, binsRes, positionBins] = await Promise.all([
-          getPool(opts.poolId),
-          getPoolBins(opts.poolId),
-          getUserPositionBins(opts.address, opts.poolId),
-        ]);
+      const [pool, binsRes, positionBins] = await Promise.all([
+        getPool(opts.poolId),
+        getPoolBins(opts.poolId),
+        getUserPositionBins(opts.address, opts.poolId),
+      ]);
 
-        if (!positionBins.length) {
-          throw new Error("Position returned no bins");
-        }
+      if (!positionBins.length) throw new Error("Position returned no bins");
 
-        const activeBinId = binsRes.active_bin_id;
-        if (activeBinId == null) throw new Error("Cannot determine active bin ID");
+      const activeBinId = binsRes.active_bin_id;
+      if (activeBinId == null) throw new Error("Cannot determine active bin ID");
 
-        const m = computeRiskMetrics(
-          activeBinId,
-          binsRes.bins,
-          positionBins,
-          threshold
-        );
+      const m = computeRiskMetrics(activeBinId, binsRes.bins, positionBins, threshold);
 
-        // No exit needed
-        if (m.riskScore < threshold) {
-          printJson({
-            action: "no_exit",
-            reason: `riskScore ${m.riskScore} is below threshold ${threshold}`,
-            verdict: m.verdict,
-            riskScore: m.riskScore,
-            driftScore: m.driftScore,
-            volatilityScore: m.volatilityScore,
-            ilEstimatePct: m.ilEstimatePct,
-            timestamp: new Date().toISOString(),
-          });
-          return;
-        }
-
-        // Filter bins with non-zero DLP
-        const exitBins = positionBins.filter(
-          (b) => BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")) > 0n
-        );
-        if (!exitBins.length) {
-          throw new Error(
-            "All position bins have zero DLP — position may already be closed"
-          );
-        }
-
-        const totalDlp = exitBins.reduce(
-          (sum, b) =>
-            sum + BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")),
-          0n
-        );
-
-        // Dry run
-        if (!opts.confirm) {
-          printJson({
-            action: "dry_run",
-            verdict: m.verdict,
-            riskScore: m.riskScore,
-            driftScore: m.driftScore,
-            volatilityScore: m.volatilityScore,
-            ilEstimatePct: m.ilEstimatePct,
-            poolId: opts.poolId,
-            address: opts.address,
-            binsToExit: exitBins.map((b) => ({
-              binId: b.bin_id,
-              dlp: String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0"),
-            })),
-            totalDlp: String(totalDlp),
-            note: "Re-run with --confirm to execute the on-chain withdrawal",
-            timestamp: new Date().toISOString(),
-          });
-          return;
-        }
-
-        // Live execution — load and verify wallet
-        const { privateKey, address } = await loadWallet();
-        if (address.toLowerCase() !== opts.address.toLowerCase()) {
-          throw new Error(
-            `Wallet mismatch: loaded wallet is ${address}, but --address is ${opts.address}`
-          );
-        }
-
-        // Fee check
-        const balance = await getStxBalance(address);
-        if (balance < TX_FEE + 10_000n) {
-          throw new Error(
-            `Insufficient STX: have ${balance} µSTX, need at least ${TX_FEE + 10_000n} µSTX for fees`
-          );
-        }
-
-        const nonce = await getNonce(address);
-        const txid = await executeExit(pool, exitBins, binsRes.bins, activeBinId, privateKey, nonce);
-
+      // No exit needed
+      if (m.riskScore < threshold) {
         printJson({
-          action: "exit_executed",
-          txid,
-          txUrl: `https://explorer.hiro.so/txid/${txid}?chain=mainnet`,
-          poolId: opts.poolId,
-          address,
-          binsExited: exitBins.length,
-          totalDlp: String(totalDlp),
+          action: "no_exit",
+          reason: `riskScore ${m.riskScore} is below threshold ${threshold}`,
+          verdict: m.verdict,
           riskScore: m.riskScore,
           driftScore: m.driftScore,
           volatilityScore: m.volatilityScore,
           ilEstimatePct: m.ilEstimatePct,
-          verdict: m.verdict,
           timestamp: new Date().toISOString(),
         });
-      } catch (error) {
-        handleError(error);
+        return;
       }
+
+      const exitBins = positionBins.filter(
+        (b) => BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")) > 0n
+      );
+      if (!exitBins.length) {
+        throw new Error("All position bins have zero DLP — position may already be closed");
+      }
+
+      const totalDlp = exitBins.reduce(
+        (sum, b) => sum + BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")),
+        0n
+      );
+
+      const batches = Math.ceil(exitBins.length / BATCH_SIZE);
+      const totalFee = estimateTotalFees(exitBins.length);
+
+      // Dry run
+      if (!opts.confirm) {
+        printJson({
+          action: "dry_run",
+          verdict: m.verdict,
+          riskScore: m.riskScore,
+          driftScore: m.driftScore,
+          volatilityScore: m.volatilityScore,
+          ilEstimatePct: m.ilEstimatePct,
+          poolId: opts.poolId,
+          address: opts.address,
+          totalBins: exitBins.length,
+          totalDlp: String(totalDlp),
+          exitPlan: {
+            batchSize: BATCH_SIZE,
+            totalBatches: batches,
+            estimatedTotalFee: `${Number(totalFee) / 1_000_000} STX`,
+            batches: Array.from({ length: batches }, (_, i) => ({
+              batchIndex: i,
+              bins: exitBins.slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE).map((b) => ({
+                binId: b.bin_id,
+                dlp: String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0"),
+              })),
+              estimatedFee: `${Number(estimateFee(Math.min(BATCH_SIZE, exitBins.length - i * BATCH_SIZE))) / 1_000_000} STX`,
+            })),
+          },
+          note: "Re-run with --confirm to execute the on-chain withdrawal",
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Live execution
+      const { privateKey, address } = await loadWallet();
+      if (address.toLowerCase() !== opts.address.toLowerCase()) {
+        throw new Error(
+          `Wallet mismatch: loaded wallet is ${address}, but --address is ${opts.address}`
+        );
+      }
+
+      // Fee check against total estimated fees across all batches
+      const balance = await getStxBalance(address);
+      const requiredBalance = totalFee + FEE_BUFFER;
+      if (balance < requiredBalance) {
+        throw new Error(
+          `Insufficient STX for ${batches} batch(es): have ${Number(balance) / 1_000_000} STX, ` +
+          `need ~${Number(requiredBalance) / 1_000_000} STX ` +
+          `(${Number(totalFee) / 1_000_000} STX fees + buffer)`
+        );
+      }
+
+      const nonce = await getNonce(address);
+      const batchResults = await executeExit(pool, exitBins, binsRes.bins, privateKey, nonce);
+
+      printJson({
+        action: "exit_executed",
+        poolId: opts.poolId,
+        address,
+        totalBinsExited: exitBins.length,
+        totalDlp: String(totalDlp),
+        riskScore: m.riskScore,
+        driftScore: m.driftScore,
+        volatilityScore: m.volatilityScore,
+        ilEstimatePct: m.ilEstimatePct,
+        verdict: m.verdict,
+        batches: batchResults,
+        // Convenience: first txid for single-batch exits
+        txid: batchResults[0]?.txid,
+        txUrl: batchResults[0]?.txUrl,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      handleError(error);
     }
-  );
+  });
 
 program.parse(process.argv);
