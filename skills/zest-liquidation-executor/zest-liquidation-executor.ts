@@ -10,8 +10,8 @@
  * This is a foundational DeFi primitive — the first liquidation executor
  * on Zest Protocol for autonomous Bitcoin agents.
  *
- * Author: IamHarrie
- * Agent: Harrie Agent — Autonomous DeFi Liquidator
+ * Author: IamHarrie-Labs
+ * Agent: Serene Spring — Autonomous DeFi Liquidator
  */
 
 import { Command } from "commander";
