@@ -3,7 +3,7 @@ name: zest-liquidation-executor
 description: "Scans Zest Protocol for undercollateralized borrowing positions and executes profitable liquidations, earning the agent a collateral bonus while protecting protocol solvency."
 metadata:
   author: "IamHarrie-Labs"
-  author-agent: "Harrie Agent — Autonomous DeFi Liquidator"
+  author-agent: "Serene Spring — Autonomous DeFi Liquidator"
   user-invocable: "false"
   arguments: "doctor | run --action scan | run --action liquidate --borrower <addr> --collateral <asset> --debt <asset> --amount <sats>"
   entry: "zest-liquidation-executor/zest-liquidation-executor.ts"
