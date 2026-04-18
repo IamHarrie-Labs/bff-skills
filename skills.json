@@ -1,0 +1,64 @@
+{
+  "generated": "2026-04-18T12:59:45.221Z",
+  "source": "BitflowFinance/bff-skills",
+  "count": 3,
+  "skills": [
+    {
+      "name": "hodlmm-inventory-balancer",
+      "description": "Detects and corrects token ratio drift in HODLMM LP positions using price-weighted exposure, then executes a Bitflow corrective swap and liquidity redeploy to restore the operator's target ratio.",
+      "metadata": {
+        "author": "IamHarrie-Labs",
+        "author-agent": "Serene Spring",
+        "user-invocable": "false",
+        "arguments": "doctor [--wallet <addr>] | scan --pool <id> --wallet <addr> [--target-ratio <pct>] [--min-drift-pct <n>] | run --pool <id> --wallet <addr> [--target-ratio <pct>] [--min-drift-pct <n>] [--max-correction-sats <n>] [--slippage-pct <n>] [--password <pwd>] --confirm=BALANCE | install-packs",
+        "entry": "hodlmm-inventory-balancer/hodlmm-inventory-balancer.ts",
+        "requires": "hodlmm-move-liquidity",
+        "tags": "defi, write, mainnet-only, requires-funds, l2"
+      },
+      "directory": "hodlmm-inventory-balancer",
+      "files": [
+        "AGENT.md",
+        "hodlmm-inventory-balancer.ts",
+        "SKILL.md"
+      ]
+    },
+    {
+      "name": "ststx-liquid-stacker",
+      "description": "Liquid stack STX via StackingDAO — deposit STX for stSTX, initiate batched withdrawals, and claim matured STX with code-enforced ratio-slippage, amount caps, reserve floors, cooldown, mainnet-only, and PostConditionMode.Deny safety gates.",
+      "metadata": {
+        "author": "IamHarrie-Labs",
+        "author-agent": "Liquid Horizon",
+        "user-invocable": "false",
+        "arguments": "doctor | status | run",
+        "entry": "ststx-liquid-stacker/ststx-liquid-stacker.ts",
+        "requires": "wallet, signing, settings",
+        "tags": "defi, write, mainnet-only, requires-funds, l2"
+      },
+      "directory": "ststx-liquid-stacker",
+      "files": [
+        "AGENT.md",
+        "SKILL.md",
+        "ststx-liquid-stacker.ts"
+      ]
+    },
+    {
+      "name": "zest-full-position-manager",
+      "description": "Full lifecycle Zest Protocol position manager — supply, borrow, repay, and withdraw with health factor as a hard-stop guardrail across all write operations on Stacks mainnet.",
+      "metadata": {
+        "author": "lesh",
+        "author-agent": "Lesh AIBTC Agent",
+        "user-invocable": "false",
+        "arguments": "doctor | run --action=status | run --action=supply | run --action=borrow | run --action=repay | run --action=withdraw | run --action=manage",
+        "entry": "zest-full-position-manager/zest-full-position-manager.ts",
+        "requires": "wallet, signing, settings",
+        "tags": "defi, write, mainnet-only, requires-funds, l2"
+      },
+      "directory": "zest-full-position-manager",
+      "files": [
+        "AGENT.md",
+        "SKILL.md",
+        "zest-full-position-manager.ts"
+      ]
+    }
+  ]
+}
