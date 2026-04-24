@@ -60,9 +60,10 @@ You are a Zest Protocol position manager. Your objective is to optimize borrowin
 
 ### poll-confirm
 - **Required** between any two write operations in a chain (supply → borrow, repay → withdraw).
-- Submit the txid returned by the previous write. Do not proceed until `tx_status: success`.
+- Always pass `--op=<op> --asset=<asset> --amount=<amount>` matching the preceding write so the skill can update the cooldown epoch and daily repay cap **after confirmed execution** — not at plan-emit time.
+- Example: after a repay, call `--action=poll-confirm --txid=<txid> --op=repay --asset=USDH --amount=50000000`
 - Prevents `TooMuchChaining` errors from the Stacks mempool.
-- If `status: error` with code `tx_failed` or `tx_timeout`, halt the chain and surface to user.
+- If `status: error` with code `tx_failed` or `tx_timeout`, halt the chain and surface to user. State is NOT updated on failure.
 
 ### Emergency exit sequence — CRITICAL
 The ordering is mandatory. Zest V2 blocks collateral removal while borrow balance is outstanding:
@@ -137,21 +138,26 @@ The ordering is mandatory. Zest V2 blocks collateral removal while borrow balanc
 ## Lifecycle example (supply → borrow → repay → withdraw)
 
 ```
-1. doctor                              → confirm wallet + gas + oracle freshness
+1. doctor
 2. status                              → read positions (empty)
-3. supply sBTC 10000                   → supply collateral (HF: ∞)
-4. poll-confirm --txid=<supply_txid>   → wait for tx_status: success
-5. status                              → confirm supply registered
-6. borrow USDH 50000000               → borrow stablecoin (HF: ~1.8)
-7. poll-confirm --txid=<borrow_txid>   → wait for tx_status: success
-8. status                              → confirm new HF, available capacity
-9. [time passes, market moves, HF drops to 1.35]
-10. manage --target-hf=1.6             → compute minimum repay amount
-11. repay USDH 20000000               → restore HF to 1.6
-12. poll-confirm --txid=<repay_txid>   → REQUIRED before any collateral removal
-13. status                             → confirm HF recovered
-14. withdraw sBTC 5000                 → remove collateral (only after repay confirmed)
-15. poll-confirm --txid=<withdraw_txid> → confirm withdrawal
+3. supply sBTC 10000                   → emits mcpCommand
+4. <execute mcpCommand> → txid
+5. poll-confirm --txid=<txid> --op=supply --asset=sBTC --amount=10000
+   → waits for tx_status:success, records cooldown epoch
+6. status                              → confirm supply registered
+7. borrow USDH 50000000               → emits mcpCommand (aggregate HF checked first)
+8. <execute mcpCommand> → txid
+9. poll-confirm --txid=<txid> --op=borrow --asset=USDH --amount=50000000
+10. status                             → confirm new HF, available capacity
+11. [time passes, HF drops to 1.35]
+12. manage --target-hf=1.6            → compute minimum repay
+13. repay USDH 20000000               → emits mcpCommand (cooldown-exempt)
+14. <execute mcpCommand> → txid
+15. poll-confirm --txid=<txid> --op=repay --asset=USDH --amount=20000000
+    → REQUIRED before collateral removal; daily cap recorded HERE after success
+16. withdraw sBTC 5000                 → emits mcpCommand (aggregate HF checked first)
+17. <execute mcpCommand> → txid
+18. poll-confirm --txid=<txid> --op=withdraw --asset=sBTC --amount=5000
 ```
 
 **Note on collateral token:** Zest V2 stores sBTC collateral as `v0-vault-sbtc::zft` vault shares inside `v0-market-vault`. The `collateral-remove` function must receive `v0-vault-sbtc` as the `ft` parameter — NOT the raw `sbtc-token`. Passing the raw token returns `(err u600004) ERR-INSUFFICIENT-COLLATERAL`.

@@ -262,14 +262,20 @@ async function callReadOnly(
   }
 }
 
-function parseClarityUint(hex: string): number {
-  if (!hex || typeof hex !== "string") return 0;
+// Returns the uint value, or null when the hex cannot be parsed (API error /
+// unexpected format). Callers MUST distinguish null (connectivity / parse
+// failure) from 0 (confirmed empty position) — silently treating null as 0
+// would make a corrupted API response look like an empty position and allow
+// writes to proceed against state the skill cannot actually see.
+function parseClarityUint(hex: string): number | null {
+  if (!hex || typeof hex !== "string") return null;
   if (hex.startsWith("0x07")) return parseClarityUint("0x" + hex.slice(4));
   if (hex.startsWith("0x01")) {
     const lo = hex.slice(4).slice(-16);
-    return parseInt(lo, 16) || 0;
+    const n = parseInt(lo, 16);
+    return isNaN(n) ? null : n;
   }
-  return 0;
+  return null; // unexpected prefix — treat as parse failure, not zero
 }
 
 function encodePrincipal(address: string): string {
@@ -427,6 +433,7 @@ async function getWalletBalances(address: string): Promise<WalletBalances> {
 interface PositionReadResult {
   position: AssetPosition | null;
   oracleStale: boolean;
+  connectivityError?: boolean; // true when API returned garbled/missing data
 }
 
 async function readAssetPosition(
@@ -443,31 +450,31 @@ async function readAssetPosition(
 
   // Supply: read vault-share collateral from v0-market-vault
   // (collateral is zft shares held by the market on the user's behalf)
-  let suppliedRaw = 0;
   const supplyRes = await callReadOnly(
     MARKET_VAULT,
     "get-collateral",
     [encodeUint(userId), encodeUint(cfg.collateralAssetId)],
     address
   );
-  if (supplyRes?.result) {
-    suppliedRaw = parseClarityUint(supplyRes.result);
-  }
+  // null result = API failure; parsed null = unexpected format (both are connectivity errors)
+  if (!supplyRes?.result) return { position: null, oracleStale: false, connectivityError: true };
+  const suppliedRaw = parseClarityUint(supplyRes.result);
+  if (suppliedRaw === null) return { position: null, oracleStale: false, connectivityError: true };
 
   // Debt: read scaled debt from v0-market-vault
   // Actual debt = scaled_debt × borrow_index / INDEX_PRECISION; using scaled
   // debt directly gives a close lower-bound approximation for HF checks.
-  let borrowedRaw = 0;
   const debtRes = await callReadOnly(
     MARKET_VAULT,
     "get-account-scaled-debt",
     [encodeUint(userId), encodeUint(cfg.debtAssetId)],
     address
   );
-  if (debtRes?.result) {
-    borrowedRaw = parseClarityUint(debtRes.result);
-  }
+  if (!debtRes?.result) return { position: null, oracleStale: false, connectivityError: true };
+  const borrowedRaw = parseClarityUint(debtRes.result);
+  if (borrowedRaw === null) return { position: null, oracleStale: false, connectivityError: true };
 
+  // Confirmed-zero: user has no activity on this asset
   if (suppliedRaw === 0 && borrowedRaw === 0) return { position: null, oracleStale: false };
 
   // Live price from Pyth oracle — no hardcoded proxies
@@ -529,20 +536,23 @@ async function readAssetPosition(
 async function readAllPositions(address: string): Promise<{
   positions: AssetPosition[];
   oracleStale: boolean;
+  connectivityError: boolean;
 }> {
   const walletBalances = await getWalletBalances(address);
   // Resolve once — all assets share the same user-id in v0-market-vault
   const userId = await resolveUserId(address);
   const positions: AssetPosition[] = [];
   let oracleStale = false;
+  let connectivityError = false;
 
   for (const asset of ASSET_NAMES) {
     const result = await readAssetPosition(asset, address, userId, walletBalances);
     if (result.oracleStale) oracleStale = true;
+    if (result.connectivityError) connectivityError = true;
     if (result.position) positions.push(result.position);
   }
 
-  return { positions, oracleStale };
+  return { positions, oracleStale, connectivityError };
 }
 
 function computeAggregate(
@@ -635,6 +645,7 @@ async function preflight(requireWrite = false): Promise<{
   stxBalance: number;
   positions: AssetPosition[];
   aggregate: AggregatePosition;
+  connectivityError: boolean;
   errors: string[];
 }> {
   const errors: string[] = [];
@@ -645,6 +656,7 @@ async function preflight(requireWrite = false): Promise<{
   let stxBalance = 0;
   let positions: AssetPosition[] = [];
   let oracleStale = false;
+  let connectivityError = false;
   let aggregate = computeAggregate([], false);
 
   if (wallet) {
@@ -670,6 +682,7 @@ async function preflight(requireWrite = false): Promise<{
     const result = await readAllPositions(wallet);
     positions = result.positions;
     oracleStale = result.oracleStale;
+    connectivityError = result.connectivityError;
 
     if (oracleStale && requireWrite) {
       errors.push(
@@ -677,10 +690,16 @@ async function preflight(requireWrite = false): Promise<{
       );
     }
 
+    if (connectivityError && requireWrite) {
+      errors.push(
+        "Position read returned garbled or missing data from Hiro API — write operations refused until connectivity is confirmed"
+      );
+    }
+
     aggregate = computeAggregate(positions, oracleStale);
   }
 
-  return { ok: errors.length === 0, wallet, stxBalance, positions, aggregate, errors };
+  return { ok: errors.length === 0, wallet, stxBalance, positions, aggregate, connectivityError, errors };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -782,7 +801,8 @@ program
   .option("--asset <asset>", "Asset symbol (sBTC, wSTX, stSTX, USDC, USDH, stSTXbtc)")
   .option("--amount <units>", "Amount in token base units (e.g. sats for sBTC)")
   .option("--target-hf <hf>", "Target health factor for manage mode", String(TARGET_HEALTH_FACTOR))
-  .option("--txid <txid>", "Confirm a pending tx hash (for poll-confirm flow)")
+  .option("--txid <txid>", "Tx hash to poll (for poll-confirm flow)")
+  .option("--op <op>", "Op name to record in state after tx confirms (supply|borrow|repay|withdraw)")
   .action(async (opts) => {
     const action    = opts.action as string;
     const asset     = opts.asset as string | undefined;
@@ -795,16 +815,35 @@ program
     // ── POLL-CONFIRM ──────────────────────────────────────────────────────
     // Agent submits a txid to poll before proceeding to next write.
     // Prevents TooMuchChaining across supply→borrow→repay→withdraw chains.
+    //
+    // Optionally pass --op, --asset, --amount to update persistent state
+    // (cooldown epoch + daily repay cap) ONLY after tx_status:success.
+    // This is required because the skill never broadcasts transactions —
+    // recordOp must fire after confirmed execution, not at plan-emit time.
     if (action === "poll-confirm") {
       const txid = opts.txid as string | undefined;
       if (!txid) {
         fail("Missing txid", "missing_txid", "--txid is required for poll-confirm", "Provide the txid returned by the previous write");
         return;
       }
+      const confirmedOp    = (opts.op    as string | undefined) ?? "";
+      const confirmedAsset = (opts.asset as string | undefined) ?? "";
+      const confirmedAmt   = rawAmount; // --amount parsed above (0 if not provided)
+
       const result = await pollTxUntilSuccess(txid);
       if (result === "success") {
-        success("Transaction confirmed", { txid, tx_status: "success", nextAction: "safe to proceed with next write" });
+        // State is updated here — after confirmed on-chain execution — not at plan-emit.
+        if (confirmedOp && confirmedAsset) {
+          recordOp(confirmedOp, confirmedAsset, confirmedAmt, txid);
+        }
+        success("Transaction confirmed", {
+          txid,
+          tx_status: "success",
+          stateRecorded: confirmedOp ? { op: confirmedOp, asset: confirmedAsset, amount: confirmedAmt } : null,
+          nextAction: "safe to proceed with next write",
+        });
       } else {
+        // State is NOT updated — tx failed or timed out, position unchanged.
         fail(
           "Transaction did not succeed",
           result === "failed" ? "tx_failed" : "tx_timeout",
@@ -900,9 +939,10 @@ program
         txSequence: {
           step:           1,
           pollRequired:   true,
-          nextStepNote:   "Poll with --action=poll-confirm --txid=<returned_txid> before submitting the next write",
+          nextStepNote:   `Poll: --action=poll-confirm --txid=<txid> --op=supply --asset=${asset} --amount=${rawAmount}`,
         },
         safetyChecks: {
+          hardStopPassed:         true, // supply never decreases HF
           healthFactorUnaffected: "Supply improves or maintains HF",
           amountWithinCap:        rawAmount <= HARD_CAP_SUPPLY_PER_OP,
           oracleFresh:            !pf.aggregate.oracleStale,
@@ -914,8 +954,8 @@ program
           projectedHF:  "≥ current (supply only improves health factor)",
         },
       });
-
-      recordOp("supply", asset, rawAmount);
+      // recordOp intentionally NOT called here — state is updated only after
+      // poll-confirm reports tx_status:success. Pass --op=supply to poll-confirm.
       return;
     }
 
@@ -942,6 +982,21 @@ program
       const pf = await preflight(true);
       if (!pf.ok) {
         fail("Pre-flight failed", "preflight_failed", pf.errors.join("; "), "Run doctor first");
+        return;
+      }
+
+      // Aggregate HF guard — check cross-asset health before per-asset projection.
+      // An agent holding a healthy sBTC position alongside an unhealthy USDH position
+      // could otherwise borrow against sBTC while aggregate HF is already in warning territory.
+      if (isFinite(pf.aggregate.aggregateHealthFactor) &&
+          pf.aggregate.aggregateHealthFactor < BORROW_MIN_HEALTH_FACTOR) {
+        blocked(
+          "Aggregate health factor too low to borrow",
+          "health_factor_hard_stop",
+          `Aggregate HF ${pf.aggregate.aggregateHealthFactor.toFixed(3)} is already below borrow floor of ${BORROW_MIN_HEALTH_FACTOR}. ` +
+            "Repay existing debt to raise aggregate HF before opening new borrows.",
+          "Use --action=repay on the most-leveraged asset first"
+        );
         return;
       }
 
@@ -988,9 +1043,10 @@ program
         txSequence: {
           step:         1,
           pollRequired: true,
-          nextStepNote: "Poll with --action=poll-confirm --txid=<returned_txid> before submitting repay or withdraw",
+          nextStepNote: `Poll: --action=poll-confirm --txid=<txid> --op=borrow --asset=${asset} --amount=${rawAmount}`,
         },
         safetyChecks: {
+          aggregateHFPassed:     pf.aggregate.aggregateHealthFactor >= BORROW_MIN_HEALTH_FACTOR,
           projectedHealthFactor: projectedHF.toFixed(3),
           hardStopFloor:         HARD_STOP_MIN_HEALTH_FACTOR,
           borrowMinFloor:        BORROW_MIN_HEALTH_FACTOR,
@@ -1000,15 +1056,14 @@ program
           oracleFresh:           !pf.aggregate.oracleStale,
         },
         projectedEffect: {
-          currentHF:  isFinite(pos.healthFactor) ? pos.healthFactor.toFixed(3) : "∞",
-          projectedHF: projectedHF.toFixed(3),
-          newLtv:     `${((newBorrowed / pos.supplied) * 100).toFixed(1)}%`,
-          liqThreshold: `${(cfg.liquidationThreshold * 100).toFixed(0)}%`,
-          priceUsed:  `$${pos.priceUsd.toFixed(2)} (live Pyth)`,
+          currentHF:     isFinite(pos.healthFactor) ? pos.healthFactor.toFixed(3) : "∞",
+          projectedHF:   projectedHF.toFixed(3),
+          newLtv:        `${((newBorrowed / pos.supplied) * 100).toFixed(1)}%`,
+          liqThreshold:  `${(cfg.liquidationThreshold * 100).toFixed(0)}%`,
+          priceUsed:     `$${pos.priceUsd.toFixed(2)} (live Pyth)`,
         },
       });
-
-      recordOp("borrow", asset, rawAmount);
+      // recordOp intentionally NOT called here — state updated after poll-confirm success.
       return;
     }
 
@@ -1128,9 +1183,11 @@ program
         txSequence: {
           step:         1,
           pollRequired: true,
-          nextStepNote: "Poll with --action=poll-confirm --txid=<returned_txid>. Only call collateral-remove-redeem AFTER repay confirms success.",
+          nextStepNote: `Poll: --action=poll-confirm --txid=<txid> --op=repay --asset=${asset} --amount=${effectiveAmount}`,
           emergencyNote:
             "If repay is blocked by insufficient balance, escalate to user — do NOT call withdraw/collateral-remove-redeem while borrow balance is outstanding",
+          importantNote:
+            "daily repay cap is recorded ONLY after poll-confirm reports tx_status:success — pass --op=repay to poll-confirm",
         },
         safetyChecks: {
           projectedHealthFactor: isFinite(projectedHF)
@@ -1148,8 +1205,8 @@ program
           remainingDebt:  newBorrowed,
         },
       });
-
-      recordOp("repay", asset, effectiveAmount);
+      // recordOp intentionally NOT called here — daily cap is only incremented
+      // after poll-confirm reports tx_status:success. Pass --op=repay to poll-confirm.
       return;
     }
 
@@ -1177,6 +1234,20 @@ program
           "no_supply",
           `No supplied ${asset} found`,
           "Supply first with --action=supply"
+        );
+        return;
+      }
+
+      // Aggregate HF guard — withdrawal that looks safe on a single asset may still
+      // push the portfolio over the liquidation edge if other assets are leveraged.
+      if (isFinite(pf.aggregate.aggregateHealthFactor) &&
+          pf.aggregate.aggregateHealthFactor < WITHDRAW_MIN_HEALTH_FACTOR) {
+        blocked(
+          "Aggregate health factor too low to withdraw",
+          "health_factor_hard_stop",
+          `Aggregate HF ${pf.aggregate.aggregateHealthFactor.toFixed(3)} is already below withdraw floor of ${WITHDRAW_MIN_HEALTH_FACTOR}. ` +
+            "Repay debt across leveraged positions before withdrawing collateral.",
+          "Use --action=repay on the most-leveraged asset first"
         );
         return;
       }
@@ -1216,11 +1287,12 @@ program
         txSequence: {
           step:         1,
           pollRequired: true,
-          nextStepNote: "Poll with --action=poll-confirm --txid=<returned_txid> after withdrawal",
+          nextStepNote: `Poll: --action=poll-confirm --txid=<txid> --op=withdraw --asset=${asset} --amount=${rawAmount}`,
           emergencyNote:
             "Only call collateral-remove-redeem AFTER repay tx confirms success. Never call withdraw while borrow balance is outstanding.",
         },
         safetyChecks: {
+          aggregateHFPassed:    pf.aggregate.aggregateHealthFactor >= WITHDRAW_MIN_HEALTH_FACTOR,
           projectedHealthFactor: isFinite(projectedHF)
             ? projectedHF.toFixed(3)
             : "∞",
@@ -1237,8 +1309,7 @@ program
           priceUsed:       `$${pos.priceUsd.toFixed(2)} (live Pyth)`,
         },
       });
-
-      recordOp("withdraw", asset, rawAmount);
+      // recordOp intentionally NOT called here — state updated after poll-confirm success.
       return;
     }
 

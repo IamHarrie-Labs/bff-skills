@@ -199,6 +199,8 @@ Agent invokes skill
   -> manage: find worst position, compute min repay, emit ordered step sequence
              repay → poll-confirm → then collateral-remove-redeem (only after success)
   -> poll-confirm: poll /extended/v1/tx/{txid} until tx_status:success
+                   if --op/--asset/--amount provided: recordOp fires HERE (after confirmed tx)
+                   NOT at plan-emit time — prevents phantom cooldowns and cap increments
 ```
 
 The skill **never broadcasts transactions directly**. It computes parameters, runs safety checks, and emits structured `mcpCommand` objects that the agent framework executes.
@@ -212,6 +214,9 @@ The skill **never broadcasts transactions directly**. It computes parameters, ru
 - Daily repay cap resets at UTC midnight (disk-persisted)
 - Requires STX for transaction fees on every write operation
 - Sequential writes must be confirmed via `poll-confirm` before the next step to avoid `TooMuchChaining`
+- `recordOp` (cooldown epoch + daily repay cap) fires inside `poll-confirm` after `tx_status:success`, **not** at plan-emit time. Always pass `--op=<op> --asset=<asset> --amount=<amount>` to `poll-confirm` so state is recorded only after confirmed on-chain execution.
+- **stSTX price approximation:** stSTX uses the raw STX Pyth feed (`ec7a775f...`). stSTX is liquid-staked STX and trades at a slight premium to STX due to staking yield accrual. HF values for stSTX collateral positions are marginally conservative (collateral is slightly undervalued). This is the safe direction — positions may be slightly healthier than reported.
+- **stSTXbtc price approximation:** stSTXbtc uses the BTC Pyth feed (`e62df6c8...`). stSTXbtc is a synthetic combining stSTX and BTC exposure, not a direct BTC proxy. HF values for stSTXbtc positions are an approximation. Agents managing stSTXbtc positions should treat computed HF as a conservative estimate and apply additional margin.
 
 ## On-chain proof (per #484 §5)
 
