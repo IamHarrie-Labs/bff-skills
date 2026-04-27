@@ -33,7 +33,7 @@ This is complementary to the existing `sbtc-yield-maximizer` (which routes idle 
 - **Gas reserve enforced.** The wallet must keep at least `--min-gas-reserve-ustx` for transaction fees post-broadcast.
 - **Cooldown enforced.** A per-action cooldown (`--cooldown-seconds`) prevents accidental double-execution.
 - **Confirmation token required.** Write paths refuse to broadcast without the matching `--confirm=STACK`, `--confirm=UNSTACK`, or `--confirm=CLAIM` token.
-- **PostConditionMode.Deny.** All emitted MCP contract-call plans request `post_condition_mode: "deny"` — any unexpected token movement aborts the transaction.
+- **PostConditionMode.Deny.** Every broadcast transaction is built with `PostConditionMode.Deny` — any unexpected token movement aborts the transaction on-chain.
 - **Cycle awareness on withdraw.** `run withdraw --id <nft-id>` reads the ticket's `cycle` field and refuses to broadcast until the StackingDAO current cycle has advanced past it.
 
 ## Commands
@@ -83,27 +83,22 @@ bun run skills/ststx-liquid-stacker/ststx-liquid-stacker.ts run \
 
 All outputs are JSON to stdout.
 
-**Success (write plan emitted):**
+**Success (broadcast confirmed):**
 
 ```json
 {
   "status": "success",
-  "action": "Deposit STX → stSTX via StackingDAO core-v2",
+  "action": "Deposit broadcast and confirmed on Stacks mainnet",
   "data": {
     "operation": "deposit",
+    "wallet": "SP...",
+    "txid": "abc123...",
+    "explorer_url": "https://explorer.hiro.so/txid/0xabc123...?chain=mainnet",
+    "tx_status": "success",
     "amount_ustx": 1000000,
-    "expected_ststx_minted": 952380,
-    "current_rate_ustx_per_ststx": 1050000,
-    "slippage_bps_observed": 0,
-    "mcp_command": {
-      "tool": "call_contract",
-      "params": {
-        "contract_address": "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG",
-        "contract_name": "stacking-dao-core-v2",
-        "function_name": "deposit",
-        "post_condition_mode": "deny"
-      }
-    }
+    "live_stx_per_ststx": "1865545",
+    "estimated_ststx_minted": "536036",
+    "slippage_bps_observed": 0
   },
   "error": null
 }
@@ -117,9 +112,9 @@ All outputs are JSON to stdout.
   "action": "aborted",
   "data": null,
   "error": {
-    "code": "RATE_SLIPPAGE_EXCEEDED",
-    "message": "Current rate 1080000 deviates 285 bps from expected 1050000 (max 50 bps)",
-    "next": "Re-read rate with `status` and re-submit with an updated --expected-rate or a wider --max-slippage-bps (operator-approved)"
+    "code": "rate_slippage_exceeded",
+    "message": "Current rate 1880000 deviates 78 bps from expected 1865545 (max 50 bps)",
+    "next": "Re-read rate with `status` and re-submit with an updated --expected-rate or a wider --max-slippage-bps"
   }
 }
 ```
@@ -127,12 +122,17 @@ All outputs are JSON to stdout.
 **Error:**
 
 ```json
-{ "error": "descriptive message" }
+{
+  "status": "error",
+  "action": "aborted",
+  "data": null,
+  "error": { "code": "broadcast_failed", "message": "...", "next": "..." }
+}
 ```
 
 ## Known constraints
 
-- StackingDAO contracts are trait-based; the skill passes the canonical `reserve-v1`, `commission-v2`, `staking-v0`, and `direct-helpers-v3` principals. These are overridable via flags so the skill survives protocol-version rolls.
+- StackingDAO contracts are trait-based; the skill passes the canonical `reserve-v1`, `commission-v2`, `staking-v0`, and `direct-helpers-v3` principals as `contractPrincipalCV` arguments. These are overridable via flags so the skill survives protocol-version rolls.
 - Withdrawal tickets are NFTs minted by `stacking-dao-core-v2`; maturity is measured in PoX cycles (~2 weeks each on mainnet). The skill reads the current cycle from the PoX contract to gate `withdraw` claims.
 - Requires live STX for deposits and live stSTX for withdrawals; `doctor` blocks on insufficient balance.
-- The skill emits an `mcp_command` block for the AIBTC MCP wallet to sign and broadcast. This matches the pattern used by the merged `sbtc-yield-maximizer` and the submitted `zest-liquidation-executor` skills.
+- `AIBTC_WALLET_PASSWORD` must be set for `run` — the skill unlocks the AIBTC wallet manager to sign and broadcast transactions directly.
