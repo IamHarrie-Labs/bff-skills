@@ -35,6 +35,7 @@ import {
   uintCV,
   noneCV,
   Pc,
+  serializeCV,
 } from "@stacks/transactions";
 import type { ContractCallOptions } from "@aibtc/mcp-server/dist/transactions/builder.js";
 import { callContract, signContractCall } from "@aibtc/mcp-server/dist/transactions/builder.js";
@@ -60,12 +61,14 @@ const TX_POLL_MAX_ATTEMPTS        = 30;              // 5 minutes total wait tim
 // ═══════════════════════════════════════════════════════════════════════════
 // STACKINGDAO MAINNET CONTRACTS (overridable via flags for protocol version rolls)
 // ═══════════════════════════════════════════════════════════════════════════
-const DEFAULT_CORE           = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.stacking-dao-core-v2";
+const DEFAULT_CORE           = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.stacking-dao-core-v6";
 const DEFAULT_STSTX_TOKEN    = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-token";
 const DEFAULT_RESERVE        = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.reserve-v1";
 const DEFAULT_COMMISSION     = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.commission-v2";
 const DEFAULT_STAKING        = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.staking-v0";
-const DEFAULT_DIRECT_HELPERS = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.direct-helpers-v3";
+const DEFAULT_DIRECT_HELPERS = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.direct-helpers-v4";
+const DEFAULT_DATA_CORE      = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.data-core-v3";
+const DEFAULT_WITHDRAW_NFT   = "SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.ststx-withdraw-nft-v2";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PERSISTENT COOLDOWN + SPEND LEDGER
@@ -233,16 +236,16 @@ async function getTokenBalance(address: string, tokenContract: string): Promise<
 // ═══════════════════════════════════════════════════════════════════════════
 async function getStxPerStstx(
   reserveContract: string,
-  ststxToken: string,
+  dataCore: string,
   sender: string
 ): Promise<bigint | null> {
-  const totalStxRes = await callReadOnly(reserveContract, "get-total-stx", [], sender);
-  const totalSupplyRes = await callReadOnly(ststxToken, "get-total-supply", [], sender);
-  if (!totalStxRes?.result || !totalSupplyRes?.result) return null;
-  const totalStx = parseOkUintHex(totalStxRes.result) || parseRawUintHex(totalStxRes.result);
-  const totalSupply = parseOkUintHex(totalSupplyRes.result);
-  if (totalStx <= 0n || totalSupply <= 0n) return null;
-  return (totalStx * 1_000_000n) / totalSupply;
+  const [resAddr, resName] = reserveContract.split(".");
+  // serializeCV returns a plain hex string in @stacks/transactions v7 — prefix with 0x for the API
+  const resHex = "0x" + (serializeCV(contractPrincipalCV(resAddr, resName)) as unknown as string);
+  const res = await callReadOnly(dataCore, "get-stx-per-ststx", [resHex], sender);
+  if (!res?.result) return null;
+  const rate = parseOkUintHex(res.result);
+  return rate > 0n ? rate : null;
 }
 
 async function getCurrentPoxCycle(core: string, sender: string): Promise<number | null> {
@@ -256,10 +259,10 @@ async function getCurrentPoxCycle(core: string, sender: string): Promise<number 
   return null;
 }
 
-async function getWithdrawalTickets(address: string, core: string): Promise<Array<{ id: number; assetId: string }>> {
+async function getWithdrawalTickets(address: string, withdrawNft: string): Promise<Array<{ id: number; assetId: string }>> {
   const data = await hiroFetch<any>(
     `/extended/v1/tokens/nft/holdings?principal=${address}&asset_identifiers=${encodeURIComponent(
-      `${core}::ststx-withdraw-nft`
+      `${withdrawNft}::ststx-withdraw-nft`
     )}&limit=50`
   );
   if (!data?.results) return [];
@@ -272,14 +275,26 @@ async function getWithdrawalTickets(address: string, core: string): Promise<Arra
   return result;
 }
 
-async function getTicketCycle(core: string, nftId: number, sender: string): Promise<number | null> {
-  const res = await callReadOnly(core, "get-withdraw-request", [encodeUintHex(nftId)], sender);
+// Reads ticket maturity from data-core-v1 (get-withdrawals-by-nft returns tuple with unlock-burn-height)
+async function getTicketCycle(dataCore1: string, nftId: number, sender: string): Promise<number | null> {
+  const res = await callReadOnly(dataCore1, "get-withdrawals-by-nft", [encodeUintHex(nftId)], sender);
   if (!res?.result) return null;
   const hex = typeof res.result === "string" ? res.result : "";
-  const m = hex.match(/01([0-9a-f]{32})/);
-  if (!m) return null;
+  // Response is a tuple: { unlock-burn-height: uint, stx-amount: uint, ststx-amount: uint }
+  // We parse unlock-burn-height — the first uint in the tuple after the tuple header
+  const m = hex.match(/0c[0-9a-f]{8}(?:[0-9a-f]+?)?01([0-9a-f]{32})/);
+  if (m) {
+    try {
+      return parseInt(m[1], 16);
+    } catch {
+      return null;
+    }
+  }
+  // Fallback: extract any uint value from the result
+  const fallback = hex.match(/01([0-9a-f]{32})/);
+  if (!fallback) return null;
   try {
-    return parseInt(m[1].slice(-8), 16);
+    return parseInt(fallback[1], 16);
   } catch {
     return null;
   }
@@ -317,7 +332,9 @@ function addContractFlags(cmd: Command): Command {
     .option("--reserve-contract <principal>", "StackingDAO reserve contract", DEFAULT_RESERVE)
     .option("--commission-contract <principal>", "StackingDAO commission contract", DEFAULT_COMMISSION)
     .option("--staking-contract <principal>", "StackingDAO staking contract", DEFAULT_STAKING)
-    .option("--direct-helpers-contract <principal>", "StackingDAO direct-helpers contract", DEFAULT_DIRECT_HELPERS);
+    .option("--direct-helpers-contract <principal>", "StackingDAO direct-helpers contract", DEFAULT_DIRECT_HELPERS)
+    .option("--data-core <principal>", "StackingDAO data core contract (rate source)", DEFAULT_DATA_CORE)
+    .option("--withdraw-nft <principal>", "StackingDAO withdraw NFT contract", DEFAULT_WITHDRAW_NFT);
 }
 
 // ── DOCTOR ─────────────────────────────────────────────────────────────────
@@ -377,7 +394,7 @@ addContractFlags(
     }
 
     if (wallet && isMainnetPrincipal(wallet)) {
-      const rate = await getStxPerStstx(opts.reserveContract, opts.ststxToken, wallet);
+      const rate = await getStxPerStstx(opts.reserveContract, opts.dataCore, wallet);
       checks.ratio_read = {
         ok: rate !== null,
         detail: rate !== null ? `1 stSTX = ${rate} uSTX (total-stx / total-supply derived)` : "could not read ratio",
@@ -445,14 +462,14 @@ addContractFlags(
     const [stx, ststx, rate, cycle, tickets] = await Promise.all([
       getStxBalance(wallet),
       getTokenBalance(wallet, opts.ststxToken),
-      getStxPerStstx(opts.reserveContract, opts.ststxToken, wallet),
+      getStxPerStstx(opts.reserveContract, opts.dataCore, wallet),
       getCurrentPoxCycle(opts.core, wallet),
-      getWithdrawalTickets(wallet, opts.core),
+      getWithdrawalTickets(wallet, opts.withdrawNft),
     ]);
 
     const ticketDetails: Array<{ id: number; cycle_id: number | null; matured: boolean | null }> = [];
     for (const t of tickets) {
-      const tCycle = await getTicketCycle(opts.core, t.id, wallet);
+      const tCycle = await getTicketCycle("SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.data-core-v1", t.id, wallet);
       ticketDetails.push({
         id: t.id,
         cycle_id: tCycle,
@@ -568,7 +585,7 @@ addContractFlags(
     }
 
     // ── Gas pre-check (all actions) ─────────────────────────────────────
-    const minGas = parseInt(opts.minGasReserveUstx, 10) || DEFAULT_MIN_GAS_USTX;
+    const minGas = !Number.isNaN(parseInt(opts.minGasReserveUstx, 10)) ? parseInt(opts.minGasReserveUstx, 10) : DEFAULT_MIN_GAS_USTX;
     const stxBal = await getStxBalance(wallet);
     if (stxBal < minGas) {
       blocked("insufficient_gas", `STX balance ${stxBal} uSTX < required ${minGas} uSTX`, "Top up STX for gas");
@@ -602,7 +619,7 @@ addContractFlags(
       const amountUstx = parseInt(opts.amountUstx, 10);
       if (!Number.isFinite(amountUstx) || amountUstx <= 0) {
         fail("bad_amount", "--amount-ustx must be a positive integer", "Supply the deposit amount in uSTX (1 STX = 1_000_000 uSTX)");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       const capPerOp = Math.min(
@@ -611,22 +628,22 @@ addContractFlags(
       );
       if (amountUstx > capPerOp) {
         blocked("exceeds_per_op_cap", `amount ${amountUstx} uSTX > per-op cap ${capPerOp} uSTX`, "Reduce --amount-ustx");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       if (ledger.totalUstxMoved + amountUstx > HARD_CAP_DAILY_USTX) {
         blocked("exceeds_daily_cap", `deposit would push daily volume over ${HARD_CAP_DAILY_USTX} uSTX`, "Wait for daily cap reset");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      const reserve = parseInt(opts.reserveUstx, 10) || DEFAULT_RESERVE_USTX;
+      const reserve = !Number.isNaN(parseInt(opts.reserveUstx, 10)) ? parseInt(opts.reserveUstx, 10) : DEFAULT_RESERVE_USTX;
       if (stxBal - amountUstx < reserve + minGas) {
         blocked(
           "reserve_violation",
           `post-deposit STX ${stxBal - amountUstx} uSTX < reserve ${reserve} + gas ${minGas}`,
           "Lower --amount-ustx or --reserve-ustx"
         );
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -634,13 +651,13 @@ addContractFlags(
       const expectedRate = BigInt(opts.expectedRateUstxPerStstx || "0");
       if (expectedRate <= 0n) {
         fail("expected_rate_missing", "--expected-rate-ustx-per-ststx required", "Run `status` to get live rate first");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      const liveRate = await getStxPerStstx(opts.reserveContract, opts.ststxToken, wallet);
+      const liveRate = await getStxPerStstx(opts.reserveContract, opts.dataCore, wallet);
       if (liveRate === null || liveRate <= 0n) {
         fail("rate_read_failed", "Could not read live stx-per-ststx from core contract", "Check Hiro API reachability");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       const deviationBps = Number(((liveRate - expectedRate) * 10_000n) / (expectedRate === 0n ? 1n : expectedRate));
@@ -651,7 +668,7 @@ addContractFlags(
           `Current rate ${liveRate} deviates ${absDev} bps from expected ${expectedRate} (max ${slippageBps} bps)`,
           "Run `status` to refresh rate and resubmit"
         );
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -672,7 +689,7 @@ addContractFlags(
         ],
         postConditionMode: PostConditionMode.Deny,
         postConditions: [
-          Pc.principal(wallet).willSendEq(amountUstx).ustx(),
+          Pc.principal(wallet).willSendLte(amountUstx).ustx(),
         ],
       };
 
@@ -688,7 +705,7 @@ addContractFlags(
           estimated_ststx_minted: expectedStstx.toString(),
           slippage_bps_observed: absDev,
         });
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -698,10 +715,10 @@ addContractFlags(
         txid = result.txid;
       } catch (e: any) {
         fail("broadcast_failed", e.message, "Check balance, contract parameters, and network");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      await wm.lock().catch(() => {});
+      wm.lock();
 
       const finalStatus = await awaitConfirmation(txid);
 
@@ -758,7 +775,7 @@ addContractFlags(
       const amountStstx = parseInt(opts.amountStstx, 10);
       if (!Number.isFinite(amountStstx) || amountStstx <= 0) {
         fail("bad_amount", "--amount-ststx must be a positive integer", "Supply the withdraw amount in stSTX micro-units");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       const capPerOp = Math.min(
@@ -767,27 +784,27 @@ addContractFlags(
       );
       if (amountStstx > capPerOp) {
         blocked("exceeds_per_op_cap", `amount ${amountStstx} stSTX > per-op cap ${capPerOp}`, "Reduce --amount-ststx");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
       const ststxBal = await getTokenBalance(wallet, opts.ststxToken);
       if (ststxBal < amountStstx) {
         blocked("insufficient_ststx", `stSTX balance ${ststxBal} < requested ${amountStstx}`, "Reduce --amount-ststx to at most wallet balance");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
       const expectedRate = BigInt(opts.expectedRateUstxPerStstx || "0");
       if (expectedRate <= 0n) {
         fail("expected_rate_missing", "--expected-rate-ustx-per-ststx required", "Run `status` to get live rate first");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      const liveRate = await getStxPerStstx(opts.reserveContract, opts.ststxToken, wallet);
+      const liveRate = await getStxPerStstx(opts.reserveContract, opts.dataCore, wallet);
       if (liveRate === null || liveRate <= 0n) {
         fail("rate_read_failed", "Could not read live stx-per-ststx", "Check Hiro API and contract principals");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       const deviationBps = Number(((liveRate - expectedRate) * 10_000n) / (expectedRate === 0n ? 1n : expectedRate));
@@ -798,13 +815,13 @@ addContractFlags(
           `Current rate ${liveRate} deviates ${absDev} bps from expected ${expectedRate} (max ${slippageBps} bps)`,
           "Re-read rate with `status` and resubmit"
         );
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
       if (ledger.totalUstxMoved + amountStstx > HARD_CAP_DAILY_USTX) {
         blocked("exceeds_daily_cap", "init-withdraw would push daily volume over cap", "Wait for cap reset");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -821,7 +838,7 @@ addContractFlags(
         ],
         postConditionMode: PostConditionMode.Deny,
         postConditions: [
-          Pc.principal(wallet).willSendEq(amountStstx).ft(`${stxTokAddr}.${stxTokName}`, "ststx"),
+          Pc.principal(wallet).willSendLte(amountStstx).ft(`${stxTokAddr}.${stxTokName}`, "ststx"),
         ],
       };
 
@@ -836,7 +853,7 @@ addContractFlags(
           queued_stx_value_ustx: queuedStxValue.toString(),
           live_stx_per_ststx: liveRate.toString(),
         });
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -846,10 +863,10 @@ addContractFlags(
         txid = result.txid;
       } catch (e: any) {
         fail("broadcast_failed", e.message, "Check stSTX balance, contract parameters, and network");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      await wm.lock().catch(() => {});
+      wm.lock();
 
       const finalStatus = await awaitConfirmation(txid);
 
@@ -908,11 +925,11 @@ addContractFlags(
       const nftId = parseInt(opts.id, 10);
       if (!Number.isFinite(nftId) || nftId <= 0) {
         fail("bad_id", "--id must be a positive integer NFT id", "Get ids from `status` > withdrawal_tickets");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
-      const tickets = await getWithdrawalTickets(wallet, opts.core);
+      const tickets = await getWithdrawalTickets(wallet, opts.withdrawNft);
       const owned = tickets.find((t) => t.id === nftId);
       if (!owned) {
         blocked(
@@ -920,17 +937,17 @@ addContractFlags(
           `Wallet ${wallet} does not hold withdrawal ticket #${nftId}`,
           "Confirm --id matches an NFT held by the active wallet"
         );
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
       const [ticketCycle, currentCycle] = await Promise.all([
-        getTicketCycle(opts.core, nftId, wallet),
+        getTicketCycle("SP4SZE494VC2YC5JYG7AYFQ44F5Q4PYV7DVMDPBG.data-core-v1", nftId, wallet),
         getCurrentPoxCycle(opts.core, wallet),
       ]);
       if (ticketCycle === null || currentCycle === null) {
         fail("cycle_read_failed", "Could not read ticket maturity cycle or current PoX cycle", "Check Hiro API and core contract");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
       if (currentCycle <= ticketCycle) {
@@ -939,7 +956,7 @@ addContractFlags(
           `Ticket #${nftId} matures in cycle ${ticketCycle}; current PoX cycle is ${currentCycle}`,
           `Wait until cycle > ${ticketCycle} before withdrawing`
         );
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -955,7 +972,7 @@ addContractFlags(
         ],
         postConditionMode: PostConditionMode.Deny,
         postConditions: [
-          Pc.principal(wallet).willSendAsset().nft(`${coreAddr}.${coreName}`, "ststx-withdraw-nft", uintCV(nftId)),
+          Pc.principal(wallet).willSendAsset().nft(opts.withdrawNft as string, "ststx-withdraw-nft", uintCV(nftId)),
         ],
       };
 
@@ -970,7 +987,7 @@ addContractFlags(
           ticket_cycle: ticketCycle,
           current_cycle: currentCycle,
         });
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
 
@@ -980,10 +997,10 @@ addContractFlags(
         txid = result.txid;
       } catch (e: any) {
         fail("broadcast_failed", e.message, "Check NFT ownership, cycle maturity, and network");
-        await wm.lock().catch(() => {});
+        wm.lock();
         return;
       }
-      await wm.lock().catch(() => {});
+      wm.lock();
 
       const finalStatus = await awaitConfirmation(txid);
 

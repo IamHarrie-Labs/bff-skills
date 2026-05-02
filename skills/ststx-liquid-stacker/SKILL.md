@@ -132,7 +132,7 @@ All outputs are JSON to stdout.
 
 ## Known constraints
 
-- StackingDAO contracts are trait-based; the skill passes the canonical `reserve-v1`, `commission-v2`, `staking-v0`, and `direct-helpers-v3` principals as `contractPrincipalCV` arguments. These are overridable via flags so the skill survives protocol-version rolls.
+- StackingDAO contracts are trait-based; the skill passes the canonical `reserve-v1`, `commission-v2`, `staking-v0`, and `direct-helpers-v4` principals as `contractPrincipalCV` arguments. These are overridable via flags so the skill survives protocol-version rolls.
 - Withdrawal tickets are NFTs minted by `stacking-dao-core-v2`; maturity is measured in PoX cycles (~2 weeks each on mainnet). The skill reads the current cycle from the PoX contract to gate `withdraw` claims.
 - Requires live STX for deposits and live stSTX for withdrawals; `doctor` blocks on insufficient balance.
 - `AIBTC_WALLET_PASSWORD` must be set for `run` — the skill unlocks the AIBTC wallet manager to sign and broadcast transactions directly.
